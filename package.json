@@ -1,0 +1,22 @@
+{
+  "name": "i18n-string-check",
+  "version": "0.1.0",
+  "description": "Fast CI checker for hardcoded i18n strings in TypeScript and JavaScript codebases.",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "i18n-string-check": "npm/bin/i18n-string-check.js"
+  },
+  "files": [
+    "assets/logo.svg",
+    "diagram.md",
+    "dist/i18n-string-check",
+    "npm/bin/i18n-string-check.js",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "go build -o dist/i18n-string-check ./cmd/i18n-string-check",
+    "test": "go test ./...",
+    "prepack": "npm run build"
+  }
+}

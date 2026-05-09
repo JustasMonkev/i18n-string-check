@@ -1,0 +1,21 @@
+# Go build/test artifacts
+/i18n-string-check
+/i18n-lint
+*.test
+coverage.out
+
+# npm/package artifacts
+/dist/
+*.tgz
+node_modules/
+testdata/node_modules/
+
+# Test and tool output
+coverage/
+playwright-report/
+test-results/
+
+# Local editor and OS files
+.idea/
+.vscode/
+.DS_Store

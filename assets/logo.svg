@@ -1,0 +1,11 @@
+<svg width="920" height="180" viewBox="0 0 920 180" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">i18n-string-check logo</title>
+  <desc id="desc">A translation string checker logo with a bracketed string mark and check symbol.</desc>
+  <rect width="920" height="180" rx="24" fill="#101820"/>
+  <rect x="28" y="28" width="124" height="124" rx="18" fill="#163A5F"/>
+  <path d="M68 62L50 90L68 118" stroke="#7DD3FC" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M112 62L130 90L112 118" stroke="#7DD3FC" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M80 95L92 107L105 82" stroke="#34D399" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="188" y="78" fill="#F8FAFC" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="38" font-weight="800" letter-spacing="0">i18n-string-check</text>
+  <text x="190" y="120" fill="#CBD5E1" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="22" font-weight="500" letter-spacing="0">catch hardcoded and stale translation strings</text>
+</svg>

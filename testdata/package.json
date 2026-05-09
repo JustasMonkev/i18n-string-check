@@ -1,0 +1,33 @@
+{
+  "name": "i18n-string-check-test-app",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "i18n:string-check:source": "i18n-string-check ./locales/en.json ./src",
+    "i18n:string-check:tests": "i18n-string-check ./locales/en.json ./tests --mode=test",
+    "i18n:string-check:fixture": "i18n-string-check ./similarity-flow/locales/en.json ./similarity-flow/src --similarity-flow"
+  },
+  "dependencies": {
+    "react": "19.2.6",
+    "react-dom": "19.2.6"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.59.1",
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.2",
+    "@types/node": "25.6.2",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.1",
+    "i18n-string-check": "file:..",
+    "jsdom": "29.1.1",
+    "typescript": "6.0.3",
+    "vite": "8.0.11",
+    "vitest": "4.1.5"
+  }
+}
