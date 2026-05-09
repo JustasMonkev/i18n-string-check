@@ -9,7 +9,6 @@
   },
   "files": [
     "assets/logo.svg",
-    "diagram.md",
     "dist/i18n-string-check",
     "npm/bin/i18n-string-check.js",
     "README.md"
