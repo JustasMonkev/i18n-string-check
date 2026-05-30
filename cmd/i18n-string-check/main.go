@@ -399,13 +399,15 @@ func scanOne(path string, minLength int, idx *i18nindex.Index, mode string, simi
 	}
 	var findings []report.Finding
 	for _, literal := range literals {
-		matches := idx.Lookup(literal.Literal)
+		// literal.NormalizedLiteral was already computed during extraction;
+		// reuse it instead of re-normalizing the literal in each lookup.
+		matches := idx.LookupNormalized(literal.NormalizedLiteral)
 		findingType := "hardcoded-translation"
 		if len(matches) == 0 && mode == modeSource {
-			matches = idx.LookupPattern(literal.Literal)
+			matches = idx.LookupPatternNormalized(literal.NormalizedLiteral)
 		}
 		if len(matches) == 0 && mode == modeSource && similarityFlow {
-			matches = idx.LookupSimilar(literal.Literal)
+			matches = idx.LookupSimilarNormalized(literal.NormalizedLiteral)
 			findingType = "changed-translation-value"
 		}
 		if len(matches) == 0 {

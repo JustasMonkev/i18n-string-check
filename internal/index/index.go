@@ -117,7 +117,16 @@ func (i *Index) Lookup(value string) []Match {
 	if i == nil {
 		return nil
 	}
-	matches := i.entries[normalize.Normalize(value)]
+	return i.LookupNormalized(normalize.Normalize(value))
+}
+
+// LookupNormalized is Lookup for callers that already hold the normalized form,
+// avoiding a redundant re-normalization of the source literal.
+func (i *Index) LookupNormalized(normalized string) []Match {
+	if i == nil {
+		return nil
+	}
+	matches := i.entries[normalized]
 	if len(matches) == 0 {
 		return nil
 	}
@@ -130,7 +139,15 @@ func (i *Index) LookupPattern(value string) []Match {
 	if i == nil {
 		return nil
 	}
-	normalized := normalize.Normalize(value)
+	return i.LookupPatternNormalized(normalize.Normalize(value))
+}
+
+// LookupPatternNormalized is LookupPattern for callers that already hold the
+// normalized form.
+func (i *Index) LookupPatternNormalized(normalized string) []Match {
+	if i == nil {
+		return nil
+	}
 	var matches []Match
 	for _, candidate := range i.patterns {
 		if candidate.pattern.MatchString(normalized) {
@@ -148,7 +165,15 @@ func (i *Index) LookupSimilar(value string) []Match {
 	if i == nil {
 		return nil
 	}
-	normalized := normalize.Normalize(value)
+	return i.LookupSimilarNormalized(normalize.Normalize(value))
+}
+
+// LookupSimilarNormalized is LookupSimilar for callers that already hold the
+// normalized form.
+func (i *Index) LookupSimilarNormalized(normalized string) []Match {
+	if i == nil {
+		return nil
+	}
 	if !similarityCandidate(normalized) {
 		return nil
 	}
