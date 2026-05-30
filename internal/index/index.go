@@ -117,7 +117,16 @@ func (i *Index) Lookup(value string) []Match {
 	if i == nil {
 		return nil
 	}
-	matches := i.entries[normalize.Normalize(value)]
+	return i.LookupNormalized(normalize.Normalize(value))
+}
+
+// LookupNormalized is Lookup for callers that already hold the normalized form,
+// avoiding a redundant re-normalization of the source literal.
+func (i *Index) LookupNormalized(normalized string) []Match {
+	if i == nil {
+		return nil
+	}
+	matches := i.entries[normalized]
 	if len(matches) == 0 {
 		return nil
 	}
@@ -130,7 +139,15 @@ func (i *Index) LookupPattern(value string) []Match {
 	if i == nil {
 		return nil
 	}
-	normalized := normalize.Normalize(value)
+	return i.LookupPatternNormalized(normalize.Normalize(value))
+}
+
+// LookupPatternNormalized is LookupPattern for callers that already hold the
+// normalized form.
+func (i *Index) LookupPatternNormalized(normalized string) []Match {
+	if i == nil {
+		return nil
+	}
 	var matches []Match
 	for _, candidate := range i.patterns {
 		if candidate.pattern.MatchString(normalized) {
@@ -148,17 +165,27 @@ func (i *Index) LookupSimilar(value string) []Match {
 	if i == nil {
 		return nil
 	}
-	normalized := normalize.Normalize(value)
+	return i.LookupSimilarNormalized(normalize.Normalize(value))
+}
+
+// LookupSimilarNormalized is LookupSimilar for callers that already hold the
+// normalized form.
+func (i *Index) LookupSimilarNormalized(normalized string) []Match {
+	if i == nil {
+		return nil
+	}
 	if !similarityCandidate(normalized) {
 		return nil
 	}
+	queryWords := wordSet(normalized)
+	candidateIndexes := i.similarCandidateIndexes(normalized, queryWords)
 	var matches []Match
-	for _, candidateIndex := range i.similarCandidateIndexes(normalized) {
+	for _, candidateIndex := range candidateIndexes {
 		match := i.all[candidateIndex]
 		if normalized == match.NormalizedValue {
 			continue
 		}
-		details, ok := similarityDetails(normalized, match.NormalizedValue)
+		details, ok := similarityDetailsWithWords(normalized, match.NormalizedValue, queryWords)
 		if ok {
 			match.Reason = details.Reason
 			match.Score = details.Score
@@ -178,9 +205,9 @@ func (i *Index) LookupSimilar(value string) []Match {
 	return matches
 }
 
-func (i *Index) similarCandidateIndexes(value string) []int {
+func (i *Index) similarCandidateIndexes(value string, words map[string]bool) []int {
 	seen := map[int]bool{}
-	for word := range wordSet(value) {
+	for word := range words {
 		if len(word) < 3 {
 			continue
 		}
@@ -345,7 +372,25 @@ func HasExactValue(matches []Match, value string) bool {
 }
 
 func similarityCandidate(value string) bool {
-	return utf8.RuneCountInString(value) >= 24 && len(strings.Fields(value)) >= 5
+	return utf8.RuneCountInString(value) >= 24 && countFields(value) >= 5
+}
+
+// countFields counts whitespace-separated fields without allocating, matching
+// the semantics of len(strings.Fields(value)) on the hot similarity path.
+func countFields(value string) int {
+	count := 0
+	inField := false
+	for _, r := range value {
+		if unicode.IsSpace(r) {
+			inField = false
+			continue
+		}
+		if !inField {
+			inField = true
+			count++
+		}
+	}
+	return count
 }
 
 type similarityDetailsResult struct {
@@ -355,6 +400,12 @@ type similarityDetailsResult struct {
 }
 
 func similarityDetails(a string, b string) (similarityDetailsResult, bool) {
+	return similarityDetailsWithWords(a, b, wordSet(a))
+}
+
+// similarityDetailsWithWords is like similarityDetails but reuses a precomputed
+// word set for a, avoiding repeated tokenization across many candidates.
+func similarityDetailsWithWords(a string, b string, aWords map[string]bool) (similarityDetailsResult, bool) {
 	if !similarityCandidate(a) || !similarityCandidate(b) {
 		return similarityDetailsResult{}, false
 	}
@@ -365,7 +416,7 @@ func similarityDetails(a string, b string) (similarityDetailsResult, bool) {
 	}
 	shorterLen := utf8.RuneCountInString(shorter)
 	longerLen := utf8.RuneCountInString(longer)
-	wordOverlap := wordOverlapRatio(a, b)
+	wordOverlap := wordOverlapRatioWithWords(aWords, wordSet(b))
 	if strings.Contains(longer, shorter) && float64(shorterLen)/float64(longerLen) >= 0.65 {
 		score := maxFloat(wordOverlap, float64(shorterLen)/float64(longerLen))
 		why := fmt.Sprintf("%d%% word overlap", percent(wordOverlap))
@@ -399,8 +450,10 @@ func similarityDetails(a string, b string) (similarityDetailsResult, bool) {
 }
 
 func wordOverlapRatio(a string, b string) float64 {
-	aWords := wordSet(a)
-	bWords := wordSet(b)
+	return wordOverlapRatioWithWords(wordSet(a), wordSet(b))
+}
+
+func wordOverlapRatioWithWords(aWords map[string]bool, bWords map[string]bool) float64 {
 	if len(aWords) == 0 || len(bWords) == 0 {
 		return 0
 	}
