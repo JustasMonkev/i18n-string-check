@@ -26,12 +26,24 @@ type Index struct {
 	entries        map[string][]Match
 	patterns       []patternMatch
 	all            []Match
+	// meta holds precomputed similarity data aligned with all; it is only
+	// populated for similarity candidates so lookups never re-tokenize or
+	// re-count entry values.
+	meta           []entryMeta
 	similarByToken map[string][]int
+}
+
+type entryMeta struct {
+	words     map[string]bool
+	runeCount int
 }
 
 type patternMatch struct {
 	match   Match
 	pattern *regexp.Regexp
+	// prefix is the pattern's literal prefix, used to skip the regex engine
+	// for the common non-matching case.
+	prefix string
 }
 
 func Load(path string, minLength int) (*Index, error) {
@@ -98,17 +110,24 @@ func (i *Index) add(key string, value string) {
 	}
 	i.entries[normalized] = append(i.entries[normalized], match)
 	i.all = append(i.all, match)
+	var meta entryMeta
 	if similarityCandidate(normalized) {
-		for word := range wordSet(normalized) {
+		meta = entryMeta{
+			words:     wordSet(normalized),
+			runeCount: utf8.RuneCountInString(normalized),
+		}
+		for word := range meta.words {
 			if len(word) >= 3 {
 				i.similarByToken[word] = append(i.similarByToken[word], index)
 			}
 		}
 	}
+	i.meta = append(i.meta, meta)
 	for _, template := range translationPatternTemplates(value) {
 		pattern, ok := compileTranslationPattern(template)
 		if ok {
-			i.patterns = append(i.patterns, patternMatch{match: match, pattern: pattern})
+			prefix, _ := pattern.LiteralPrefix()
+			i.patterns = append(i.patterns, patternMatch{match: match, pattern: pattern, prefix: prefix})
 		}
 	}
 }
@@ -150,6 +169,9 @@ func (i *Index) LookupPatternNormalized(normalized string) []Match {
 	}
 	var matches []Match
 	for _, candidate := range i.patterns {
+		if candidate.prefix != "" && !strings.HasPrefix(normalized, candidate.prefix) {
+			continue
+		}
 		if candidate.pattern.MatchString(normalized) {
 			match := candidate.match
 			match.Reason = "translation-pattern"
@@ -178,14 +200,16 @@ func (i *Index) LookupSimilarNormalized(normalized string) []Match {
 		return nil
 	}
 	queryWords := wordSet(normalized)
-	candidateIndexes := i.similarCandidateIndexes(normalized, queryWords)
+	queryRunes := utf8.RuneCountInString(normalized)
+	candidateIndexes := i.similarCandidateIndexes(queryRunes, queryWords)
 	var matches []Match
 	for _, candidateIndex := range candidateIndexes {
 		match := i.all[candidateIndex]
 		if normalized == match.NormalizedValue {
 			continue
 		}
-		details, ok := similarityDetailsWithWords(normalized, match.NormalizedValue, queryWords)
+		meta := i.meta[candidateIndex]
+		details, ok := similarityDetailsPrecomputed(normalized, queryRunes, queryWords, match.NormalizedValue, meta.runeCount, meta.words)
 		if ok {
 			match.Reason = details.Reason
 			match.Score = details.Score
@@ -205,14 +229,14 @@ func (i *Index) LookupSimilarNormalized(normalized string) []Match {
 	return matches
 }
 
-func (i *Index) similarCandidateIndexes(value string, words map[string]bool) []int {
+func (i *Index) similarCandidateIndexes(queryRunes int, words map[string]bool) []int {
 	seen := map[int]bool{}
 	for word := range words {
 		if len(word) < 3 {
 			continue
 		}
 		for _, index := range i.similarByToken[word] {
-			if likelySimilarLength(value, i.all[index].NormalizedValue) {
+			if !seen[index] && likelySimilarLength(queryRunes, i.meta[index].runeCount) {
 				seen[index] = true
 			}
 		}
@@ -225,9 +249,7 @@ func (i *Index) similarCandidateIndexes(value string, words map[string]bool) []i
 	return indexes
 }
 
-func likelySimilarLength(a string, b string) bool {
-	aLen := utf8.RuneCountInString(a)
-	bLen := utf8.RuneCountInString(b)
+func likelySimilarLength(aLen int, bLen int) bool {
 	if aLen == 0 || bLen == 0 {
 		return false
 	}
@@ -399,28 +421,27 @@ type similarityDetailsResult struct {
 	Why    string
 }
 
-func similarityDetails(a string, b string) (similarityDetailsResult, bool) {
-	return similarityDetailsWithWords(a, b, wordSet(a))
-}
-
-// similarityDetailsWithWords is like similarityDetails but reuses a precomputed
-// word set for a, avoiding repeated tokenization across many candidates.
-func similarityDetailsWithWords(a string, b string, aWords map[string]bool) (similarityDetailsResult, bool) {
-	if !similarityCandidate(a) || !similarityCandidate(b) {
-		return similarityDetailsResult{}, false
-	}
-
+// similarityDetailsPrecomputed reports how similar query a is to candidate b.
+// Both sides are already known to be similarity candidates, and word sets and
+// rune counts are precomputed so the per-candidate cost stays low. The
+// expensive Levenshtein distance only runs when the cheap word-overlap and
+// length-ratio bounds show its threshold is still reachable: the edit
+// similarity can never exceed shorterLen/longerLen.
+func similarityDetailsPrecomputed(a string, aRunes int, aWords map[string]bool, b string, bRunes int, bWords map[string]bool) (similarityDetailsResult, bool) {
 	shorter, longer := a, b
-	if utf8.RuneCountInString(shorter) > utf8.RuneCountInString(longer) {
-		shorter, longer = longer, shorter
+	shorterLen, longerLen := aRunes, bRunes
+	bIsLonger := true
+	if aRunes > bRunes {
+		shorter, longer = b, a
+		shorterLen, longerLen = bRunes, aRunes
+		bIsLonger = false
 	}
-	shorterLen := utf8.RuneCountInString(shorter)
-	longerLen := utf8.RuneCountInString(longer)
-	wordOverlap := wordOverlapRatioWithWords(aWords, wordSet(b))
-	if strings.Contains(longer, shorter) && float64(shorterLen)/float64(longerLen) >= 0.65 {
-		score := maxFloat(wordOverlap, float64(shorterLen)/float64(longerLen))
+	lengthRatio := float64(shorterLen) / float64(longerLen)
+	wordOverlap := wordOverlapRatioWithWords(aWords, bWords)
+	if lengthRatio >= 0.65 && strings.Contains(longer, shorter) {
+		score := maxFloat(wordOverlap, lengthRatio)
 		why := fmt.Sprintf("%d%% word overlap", percent(wordOverlap))
-		if b == longer {
+		if bIsLonger {
 			why = "source string is contained in the current translation value; " + why
 		} else {
 			why = "current translation value is contained in the source string; " + why
@@ -431,13 +452,15 @@ func similarityDetailsWithWords(a string, b string, aWords map[string]bool) (sim
 			Why:    why,
 		}, true
 	}
-	editSimilarity := levenshteinRatio(a, b)
-	if editSimilarity >= 0.78 && wordOverlap >= 0.5 {
-		return similarityDetailsResult{
-			Reason: "edit-similarity",
-			Score:  editSimilarity,
-			Why:    fmt.Sprintf("%d%% edit similarity with %d%% word overlap", percent(editSimilarity), percent(wordOverlap)),
-		}, true
+	if wordOverlap >= 0.5 && lengthRatio >= 0.78 {
+		editSimilarity := levenshteinRatio(a, b)
+		if editSimilarity >= 0.78 {
+			return similarityDetailsResult{
+				Reason: "edit-similarity",
+				Score:  editSimilarity,
+				Why:    fmt.Sprintf("%d%% edit similarity with %d%% word overlap", percent(editSimilarity), percent(wordOverlap)),
+			}, true
+		}
 	}
 	if wordOverlap >= 0.7 {
 		return similarityDetailsResult{
@@ -447,10 +470,6 @@ func similarityDetailsWithWords(a string, b string, aWords map[string]bool) (sim
 		}, true
 	}
 	return similarityDetailsResult{}, false
-}
-
-func wordOverlapRatio(a string, b string) float64 {
-	return wordOverlapRatioWithWords(wordSet(a), wordSet(b))
 }
 
 func wordOverlapRatioWithWords(aWords map[string]bool, bWords map[string]bool) float64 {

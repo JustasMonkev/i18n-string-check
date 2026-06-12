@@ -352,7 +352,7 @@ func scanAndMatch(files []string, minLength int, idx *i18nindex.Index, mode stri
 		workers = len(files)
 	}
 
-	jobs := make(chan string)
+	jobs := make(chan string, len(files))
 	results := make(chan fileResult, len(files))
 	var wg sync.WaitGroup
 

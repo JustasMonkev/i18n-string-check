@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,11 +39,127 @@ var parserPool = sync.Pool{
 	New: func() any { return sitter.NewParser() },
 }
 
+var queryCursorPool = sync.Pool{
+	New: func() any { return sitter.NewQueryCursor() },
+}
+
 const ignoreMarker = "i18n-string-check-ignore"
 
+type literalKind int
+
+const (
+	kindString literalKind = iota
+	kindTemplate
+	kindJSXText
+)
+
+// nodeClass groups the node types the context filters care about. Classifying
+// by numeric symbol id (one cgo call) replaces Node.Type(), which crosses cgo
+// and allocates a Go string on every call.
+type nodeClass uint8
+
+const (
+	classNone nodeClass = iota
+	classPair
+	classArguments
+	classCallExpression
+	classTypeKey
+	classImportExport
+	classJSXAttribute
+	classJSXElement
+	classObject
+	classScopeStop
+	classTemplateSubstitution
+	classAttributeName
+)
+
+var classByName = map[string]nodeClass{
+	"pair":                     classPair,
+	"arguments":                classArguments,
+	"call_expression":          classCallExpression,
+	"property_signature":       classTypeKey,
+	"method_signature":         classTypeKey,
+	"enum_assignment":          classTypeKey,
+	"import_statement":         classImportExport,
+	"export_statement":         classImportExport,
+	"jsx_attribute":            classJSXAttribute,
+	"jsx_element":              classJSXElement,
+	"jsx_self_closing_element": classJSXElement,
+	"object":                   classObject,
+	"statement_block":          classScopeStop,
+	"program":                  classScopeStop,
+	"template_substitution":    classTemplateSubstitution,
+	"property_identifier":      classAttributeName,
+	"identifier":               classAttributeName,
+	"nested_identifier":        classAttributeName,
+}
+
+// langSupport holds the per-language pieces of the hot path: a precompiled
+// query that finds candidate literal nodes inside C tree-sitter code (one cgo
+// crossing per candidate instead of several per AST node), and a symbol-id to
+// nodeClass table for cheap ancestor classification.
+type langSupport struct {
+	query *sitter.Query
+	// kinds maps a query capture index to the literal kind it captures,
+	// avoiding a cgo Node.Type() call per candidate.
+	kinds   []literalKind
+	classes []nodeClass
+}
+
+func newLangSupport(lang *sitter.Language) (*langSupport, error) {
+	const withJSX = "(string) @string\n(template_string) @template\n(jsx_text) @jsxtext"
+	const withoutJSX = "(string) @string\n(template_string) @template"
+	query, err := sitter.NewQuery([]byte(withJSX), lang)
+	if err != nil {
+		// Grammars without JSX support (plain TypeScript) reject jsx_text.
+		query, err = sitter.NewQuery([]byte(withoutJSX), lang)
+		if err != nil {
+			return nil, err
+		}
+	}
+	ls := &langSupport{query: query}
+	for i := uint32(0); i < query.CaptureCount(); i++ {
+		switch query.CaptureNameForId(i) {
+		case "string":
+			ls.kinds = append(ls.kinds, kindString)
+		case "template":
+			ls.kinds = append(ls.kinds, kindTemplate)
+		case "jsxtext":
+			ls.kinds = append(ls.kinds, kindJSXText)
+		default:
+			return nil, fmt.Errorf("unexpected capture %q", query.CaptureNameForId(i))
+		}
+	}
+	ls.classes = make([]nodeClass, lang.SymbolCount())
+	for symbol := uint32(0); symbol < lang.SymbolCount(); symbol++ {
+		if class, ok := classByName[lang.SymbolName(sitter.Symbol(symbol))]; ok {
+			ls.classes[symbol] = class
+		}
+	}
+	return ls, nil
+}
+
+func (ls *langSupport) classOf(node *sitter.Node) nodeClass {
+	symbol := uint32(node.Symbol())
+	if symbol >= uint32(len(ls.classes)) {
+		return classNone
+	}
+	return ls.classes[symbol]
+}
+
+var (
+	typescriptSupport = sync.OnceValues(func() (*langSupport, error) { return newLangSupport(typescript.GetLanguage()) })
+	tsxSupport        = sync.OnceValues(func() (*langSupport, error) { return newLangSupport(tsx.GetLanguage()) })
+	javascriptSupport = sync.OnceValues(func() (*langSupport, error) { return newLangSupport(javascript.GetLanguage()) })
+)
+
 func Bytes(path string, content []byte, minLength int) ([]Literal, error) {
+	language, ls, err := languageForPath(path)
+	if err != nil {
+		return nil, err
+	}
 	parser := parserPool.Get().(*sitter.Parser)
-	parser.SetLanguage(languageForPath(path))
+	parser.SetLanguage(language)
 	tree, err := parser.ParseCtx(context.Background(), nil, content)
 	parserPool.Put(parser)
 	if err != nil {
@@ -58,9 +175,31 @@ func Bytes(path string, content []byte, minLength int) ([]Literal, error) {
 		content:     content,
 		minLength:   minLength,
 		path:        path,
+		lang:        ls,
 		ignoreLines: ignoreMarkerLines(content),
 	}
-	w.walk(root)
+
+	cursor := queryCursorPool.Get().(*sitter.QueryCursor)
+	cursor.Exec(ls.query, root)
+	for {
+		match, ok := cursor.NextMatch()
+		if !ok {
+			break
+		}
+		for _, capture := range match.Captures {
+			w.visit(ls.kinds[capture.Index], capture.Node)
+		}
+	}
+	queryCursorPool.Put(cursor)
+
+	// Query matches arrive in traversal order; sort to guarantee document
+	// order for callers and tests.
+	sort.Slice(w.literals, func(i, j int) bool {
+		if w.literals[i].Line != w.literals[j].Line {
+			return w.literals[i].Line < w.literals[j].Line
+		}
+		return w.literals[i].Column < w.literals[j].Column
+	})
 	return w.literals, nil
 }
 
@@ -68,6 +207,7 @@ type walker struct {
 	content   []byte
 	minLength int
 	path      string
+	lang      *langSupport
 	// ignoreLines marks zero-based rows that contain the inline ignore marker.
 	// It is nil when the marker is absent from the file (the common case).
 	ignoreLines []bool
@@ -88,46 +228,40 @@ func ignoreMarkerLines(content []byte) []bool {
 	return lines
 }
 
-func languageForPath(path string) *sitter.Language {
+func languageForPath(path string) (*sitter.Language, *langSupport, error) {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".ts":
-		return typescript.GetLanguage()
+		ls, err := typescriptSupport()
+		return typescript.GetLanguage(), ls, err
 	case ".tsx", ".jsx":
-		return tsx.GetLanguage()
+		ls, err := tsxSupport()
+		return tsx.GetLanguage(), ls, err
 	default:
-		return javascript.GetLanguage()
+		ls, err := javascriptSupport()
+		return javascript.GetLanguage(), ls, err
 	}
 }
 
-func (w *walker) walk(node *sitter.Node) {
-	if node == nil || node.IsNull() {
-		return
-	}
-
-	switch node.Type() {
-	case "string":
-		if shouldScanString(node, w.content) {
-			w.addLiteral(node, decodeQuoted)
+func (w *walker) visit(kind literalKind, node *sitter.Node) {
+	var value string
+	switch kind {
+	case kindString:
+		decoded, ok := decodeQuoted(node.Content(w.content))
+		if !ok {
+			return
 		}
-	case "template_string":
-		if !hasChildType(node, "template_substitution") {
-			w.addLiteral(node, decodeTemplate)
+		value = decoded
+	case kindTemplate:
+		if w.hasSubstitution(node) {
+			return
 		}
-	case "jsx_text":
-		w.addLiteral(node, func(raw string) (string, bool) {
-			return strings.TrimSpace(raw), true
-		})
-	}
-
-	for i := 0; i < int(node.ChildCount()); i++ {
-		w.walk(node.Child(i))
-	}
-}
-
-func (w *walker) addLiteral(node *sitter.Node, decode func(string) (string, bool)) {
-	value, ok := decode(node.Content(w.content))
-	if !ok {
-		return
+		decoded, ok := decodeTemplate(node.Content(w.content))
+		if !ok {
+			return
+		}
+		value = decoded
+	case kindJSXText:
+		value = strings.TrimSpace(node.Content(w.content))
 	}
 	// Collapse whitespace once and reuse it for the length check, the stored
 	// literal, and the normalized form instead of recomputing it three times.
@@ -137,6 +271,11 @@ func (w *walker) addLiteral(node *sitter.Node, decode func(string) (string, bool
 	}
 	normalized := strings.ToLower(collapsed)
 	if normalized == "" {
+		return
+	}
+	// Context checks walk the ancestor chain through cgo, so run them only
+	// after the literal has survived the cheap length filter above.
+	if kind == kindString && !w.shouldScanString(node) {
 		return
 	}
 	point := node.StartPoint()
@@ -164,88 +303,80 @@ func (w *walker) hasInlineIgnore(zeroBasedRow int) bool {
 	return false
 }
 
-func shouldScanString(node *sitter.Node, content []byte) bool {
-	if isObjectKey(node) || isTypeLiteralKey(node) || isImportOrExportSource(node) || isRequireArg(node, content) {
-		return false
+// shouldScanString applies all context filters (object keys, type literal
+// keys, import/export sources, require() arguments, JSX attributes) in a
+// single walk up the ancestor chain. Every Parent()/Symbol() call crosses
+// cgo, so the filters share one traversal instead of re-walking per filter.
+//
+// Rejection filters take precedence over the JSX attribute visibility check,
+// matching the historical evaluation order: each filter scans upward until
+// its own stop node, independent of the others.
+func (w *walker) shouldScanString(node *sitter.Node) bool {
+	parent := node.Parent()
+	if parent == nil {
+		return true
 	}
-	if attribute := jsxAttributeAncestor(node); attribute != nil {
-		return isVisibleJSXAttribute(attribute, content)
+	switch w.lang.classOf(parent) {
+	case classPair:
+		key := parent.ChildByFieldName("key")
+		if key != nil && key.Equal(node) {
+			return false
+		}
+	case classArguments:
+		call := parent.Parent()
+		if call != nil && w.lang.classOf(call) == classCallExpression {
+			fn := call.ChildByFieldName("function")
+			if fn != nil && fn.Content(w.content) == "require" {
+				return false
+			}
+		}
+	}
+
+	// Active flags track which filters are still scanning; each filter stops
+	// at its own boundary node types.
+	typeKeyActive, importActive, jsxActive := true, true, true
+	var jsxAttribute *sitter.Node
+	for p := parent; p != nil; p = p.Parent() {
+		switch w.lang.classOf(p) {
+		case classTypeKey:
+			if typeKeyActive {
+				return false
+			}
+		case classImportExport:
+			if importActive {
+				return false
+			}
+		case classJSXAttribute:
+			if jsxActive {
+				jsxAttribute = p
+				jsxActive = false
+			}
+		case classJSXElement:
+			jsxActive = false
+		case classObject:
+			typeKeyActive = false
+		case classScopeStop:
+			typeKeyActive, importActive, jsxActive = false, false, false
+		}
+		if !typeKeyActive && !importActive && !jsxActive {
+			break
+		}
+	}
+	if jsxAttribute != nil {
+		return w.isVisibleJSXAttribute(jsxAttribute)
 	}
 	return true
 }
 
-func jsxAttributeAncestor(node *sitter.Node) *sitter.Node {
-	for parent := node.Parent(); parent != nil && !parent.IsNull(); parent = parent.Parent() {
-		switch parent.Type() {
-		case "jsx_attribute":
-			return parent
-		case "jsx_element", "jsx_self_closing_element", "program", "statement_block":
-			return nil
-		}
-	}
-	return nil
-}
-
-func isObjectKey(node *sitter.Node) bool {
-	parent := node.Parent()
-	if parent == nil || parent.IsNull() || parent.Type() != "pair" {
-		return false
-	}
-	key := parent.ChildByFieldName("key")
-	return key != nil && !key.IsNull() && key.Equal(node)
-}
-
-func isTypeLiteralKey(node *sitter.Node) bool {
-	for parent := node.Parent(); parent != nil && !parent.IsNull(); parent = parent.Parent() {
-		switch parent.Type() {
-		case "property_signature", "method_signature", "enum_assignment":
-			return true
-		case "statement_block", "program", "object":
-			return false
-		}
-	}
-	return false
-}
-
-func isImportOrExportSource(node *sitter.Node) bool {
-	for parent := node.Parent(); parent != nil && !parent.IsNull(); parent = parent.Parent() {
-		switch parent.Type() {
-		case "import_statement", "export_statement":
-			return true
-		case "program", "statement_block":
-			return false
-		}
-	}
-	return false
-}
-
-func isRequireArg(node *sitter.Node, content []byte) bool {
-	parent := node.Parent()
-	if parent == nil || parent.IsNull() || parent.Type() != "arguments" {
-		return false
-	}
-	call := parent.Parent()
-	if call == nil || call.IsNull() || call.Type() != "call_expression" {
-		return false
-	}
-	fn := call.ChildByFieldName("function")
-	return fn != nil && !fn.IsNull() && fn.Content(content) == "require"
-}
-
-func isVisibleJSXAttribute(attribute *sitter.Node, content []byte) bool {
+func (w *walker) isVisibleJSXAttribute(attribute *sitter.Node) bool {
 	name := ""
 	for i := 0; i < int(attribute.ChildCount()); i++ {
 		child := attribute.Child(i)
-		if child == nil || child.IsNull() {
+		if child == nil {
 			continue
 		}
-		switch child.Type() {
-		case "property_identifier", "identifier":
-			name = child.Content(content)
-		case "nested_identifier":
-			name = child.Content(content)
-		}
-		if name != "" {
+		if w.lang.classOf(child) == classAttributeName {
+			name = child.Content(w.content)
 			break
 		}
 	}
@@ -257,10 +388,10 @@ func isVisibleJSXAttribute(attribute *sitter.Node, content []byte) bool {
 	}
 }
 
-func hasChildType(node *sitter.Node, childType string) bool {
+func (w *walker) hasSubstitution(node *sitter.Node) bool {
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
-		if child != nil && !child.IsNull() && child.Type() == childType {
+		if child != nil && w.lang.classOf(child) == classTemplateSubstitution {
 			return true
 		}
 	}
@@ -286,6 +417,9 @@ func decodeTemplate(raw string) (string, bool) {
 }
 
 func unquoteJS(value string, quote byte) string {
+	if strings.IndexByte(value, '\\') < 0 {
+		return value
+	}
 	var out strings.Builder
 	for len(value) > 0 {
 		r, _, tail, err := strconv.UnquoteChar(value, quote)
