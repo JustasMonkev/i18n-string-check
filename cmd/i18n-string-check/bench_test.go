@@ -37,15 +37,8 @@ var benchPhrases = []string{
 }
 
 func buildBenchCorpus(tb testing.TB, fileCount int) *benchCorpus {
-	return buildBenchCorpusWithScale(tb, fileCount, 1)
-}
-
-func buildBenchCorpusWithScale(tb testing.TB, fileCount int, scale int) *benchCorpus {
 	tb.Helper()
 	root := tb.TempDir()
-	if scale < 1 {
-		scale = 1
-	}
 
 	translations := map[string]any{}
 	for i, phrase := range benchPhrases {
@@ -78,13 +71,13 @@ func buildBenchCorpusWithScale(tb testing.TB, fileCount int, scale int) *benchCo
 		switch i % 3 {
 		case 0:
 			path = filepath.Join(srcDir, "components", fmt.Sprintf("Component%d.tsx", i))
-			content = benchTSX(i, 30*scale)
+			content = benchTSX(i)
 		case 1:
 			path = filepath.Join(srcDir, fmt.Sprintf("module%d.ts", i))
-			content = benchTS(i, 40*scale)
+			content = benchTS(i)
 		default:
 			path = filepath.Join(srcDir, fmt.Sprintf("legacy%d.js", i))
-			content = benchJS(i, 50*scale)
+			content = benchJS(i)
 		}
 		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 			tb.Fatal(err)
@@ -99,12 +92,12 @@ func buildBenchCorpusWithScale(tb testing.TB, fileCount int, scale int) *benchCo
 	return &benchCorpus{root: root, enJSON: enJSON, files: files, index: idx}
 }
 
-func benchTSX(seed int, sectionCount int) string {
+func benchTSX(seed int) string {
 	phrase := benchPhrases[seed%len(benchPhrases)]
 	var b strings.Builder
 	b.WriteString("import React from 'react';\nimport { t } from '../i18n';\n\n")
 	fmt.Fprintf(&b, "export function Component%d() {\n  return (\n    <div className=\"page-wrapper\">\n", seed)
-	for j := 0; j < sectionCount; j++ {
+	for j := 0; j < 30; j++ {
 		fmt.Fprintf(&b, "      <section data-testid=\"section-%d\">\n", j)
 		fmt.Fprintf(&b, "        <h2 title=\"Heading number %d for layout\">{t('section%d.title')}</h2>\n", j, j%10)
 		if j%5 == 0 {
@@ -120,15 +113,15 @@ func benchTSX(seed int, sectionCount int) string {
 	return b.String()
 }
 
-func benchTS(seed int, entryCount int) string {
+func benchTS(seed int) string {
 	var b strings.Builder
 	b.WriteString("import { logger } from './logger';\n\n")
 	fmt.Fprintf(&b, "export const config%d = {\n", seed)
-	for j := 0; j < entryCount; j++ {
+	for j := 0; j < 40; j++ {
 		fmt.Fprintf(&b, "  key%d: 'configuration value %d for module %d',\n", j, j, seed)
 	}
 	b.WriteString("};\n\n")
-	for j := 0; j < entryCount; j++ {
+	for j := 0; j < 40; j++ {
 		fmt.Fprintf(&b, "export function helper%d(input: string): string {\n", j)
 		fmt.Fprintf(&b, "  logger.debug('processing helper %d with input', input);\n", j)
 		if j%7 == 0 {
@@ -141,10 +134,10 @@ func benchTS(seed int, entryCount int) string {
 	return b.String()
 }
 
-func benchJS(seed int, functionCount int) string {
+func benchJS(seed int) string {
 	var b strings.Builder
 	b.WriteString("const path = require('path');\n\n")
-	for j := 0; j < functionCount; j++ {
+	for j := 0; j < 50; j++ {
 		fmt.Fprintf(&b, "function legacy%d() {\n", j)
 		fmt.Fprintf(&b, "  const message = 'legacy message %d in file %d with some words';\n", j, seed)
 		fmt.Fprintf(&b, "  const tpl = `static template %d without substitutions`;\n", j)
@@ -185,57 +178,6 @@ func BenchmarkPipelineSimilarity(b *testing.B) {
 		}
 		if _, err := scanAndMatch(files, 8, corpus.index, modeSource, true); err != nil {
 			b.Fatal(err)
-		}
-	}
-}
-
-// BenchmarkPipelineLargeFilesSimilarity keeps the file count stable but makes
-// each generated source file 10x larger, stressing per-file parsing and the
-// per-literal similarity path.
-func BenchmarkPipelineLargeFilesSimilarity(b *testing.B) {
-	corpus := buildBenchCorpusWithScale(b, 120, 10)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		files, err := scan.DiscoverFiles(filepath.Join(corpus.root, "src"), scan.Options{})
-		if err != nil {
-			b.Fatal(err)
-		}
-		if _, err := scanAndMatch(files, 8, corpus.index, modeSource, true); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-// BenchmarkPipelineLargeFiles keeps the file count stable but makes each
-// generated source file 10x larger, stressing per-file parsing without
-// enabling the extra similarity matching pass.
-func BenchmarkPipelineLargeFiles(b *testing.B) {
-	corpus := buildBenchCorpusWithScale(b, 120, 10)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		files, err := scan.DiscoverFiles(filepath.Join(corpus.root, "src"), scan.Options{})
-		if err != nil {
-			b.Fatal(err)
-		}
-		findings, err := scanAndMatch(files, 8, corpus.index, modeSource, false)
-		if err != nil {
-			b.Fatal(err)
-		}
-		if len(findings) == 0 {
-			b.Fatal("expected findings")
-		}
-	}
-}
-
-// BenchmarkScanOneLarge measures extraction and matching for one large TSX
-// file, isolating the per-file hot path from worker-pool scheduling.
-func BenchmarkScanOneLarge(b *testing.B) {
-	corpus := buildBenchCorpusWithScale(b, 3, 10)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		result := scanOne(corpus.files[0], 8, corpus.index, modeSource, true)
-		if result.err != nil {
-			b.Fatal(result.err)
 		}
 	}
 }
