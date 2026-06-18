@@ -8,7 +8,6 @@ import (
 	"sort"
 	"strings"
 	"unicode"
-	"unicode/utf8"
 
 	"github.com/justasmonkev/i18n-string-check/internal/normalize"
 )
@@ -23,9 +22,9 @@ type Match struct {
 }
 
 type Index struct {
-	entries        map[string][]Match
-	patterns       []patternMatch
-	all            []Match
+	entries  map[string][]Match
+	patterns []patternMatch
+	all      []Match
 	// meta holds precomputed similarity data aligned with all; it is only
 	// populated for similarity candidates so lookups never re-tokenize or
 	// re-count entry values.
@@ -111,11 +110,8 @@ func (i *Index) add(key string, value string) {
 	i.entries[normalized] = append(i.entries[normalized], match)
 	i.all = append(i.all, match)
 	var meta entryMeta
-	if similarityCandidate(normalized) {
-		meta = entryMeta{
-			words:     wordSet(normalized),
-			runeCount: utf8.RuneCountInString(normalized),
-		}
+	if similarityMeta, ok := buildSimilarityMeta(normalized); ok {
+		meta = similarityMeta
 		for word := range meta.words {
 			if len(word) >= 3 {
 				i.similarByToken[word] = append(i.similarByToken[word], index)
@@ -196,12 +192,11 @@ func (i *Index) LookupSimilarNormalized(normalized string) []Match {
 	if i == nil {
 		return nil
 	}
-	if !similarityCandidate(normalized) {
+	queryMeta, ok := buildSimilarityMeta(normalized)
+	if !ok {
 		return nil
 	}
-	queryWords := wordSet(normalized)
-	queryRunes := utf8.RuneCountInString(normalized)
-	candidateIndexes := i.similarCandidateIndexes(queryRunes, queryWords)
+	candidateIndexes := i.similarCandidateIndexes(queryMeta.runeCount, queryMeta.words)
 	var matches []Match
 	for _, candidateIndex := range candidateIndexes {
 		match := i.all[candidateIndex]
@@ -209,7 +204,7 @@ func (i *Index) LookupSimilarNormalized(normalized string) []Match {
 			continue
 		}
 		meta := i.meta[candidateIndex]
-		details, ok := similarityDetailsPrecomputed(normalized, queryRunes, queryWords, match.NormalizedValue, meta.runeCount, meta.words)
+		details, ok := similarityDetailsPrecomputed(normalized, queryMeta.runeCount, queryMeta.words, match.NormalizedValue, meta.runeCount, meta.words)
 		if ok {
 			match.Reason = details.Reason
 			match.Score = details.Score
@@ -230,22 +225,34 @@ func (i *Index) LookupSimilarNormalized(normalized string) []Match {
 }
 
 func (i *Index) similarCandidateIndexes(queryRunes int, words map[string]bool) []int {
-	seen := map[int]bool{}
+	var seen map[int]bool
 	for word := range words {
 		if len(word) < 3 {
 			continue
 		}
-		for _, index := range i.similarByToken[word] {
+		tokenIndexes := i.similarByToken[word]
+		if len(tokenIndexes) == 0 {
+			continue
+		}
+		if seen == nil {
+			seen = make(map[int]bool, len(tokenIndexes))
+		}
+		for _, index := range tokenIndexes {
 			if !seen[index] && likelySimilarLength(queryRunes, i.meta[index].runeCount) {
 				seen[index] = true
 			}
 		}
 	}
+	if len(seen) == 0 {
+		return nil
+	}
 	indexes := make([]int, 0, len(seen))
 	for index := range seen {
 		indexes = append(indexes, index)
 	}
-	sort.Ints(indexes)
+	if len(indexes) > 1 {
+		sort.Ints(indexes)
+	}
 	return indexes
 }
 
@@ -393,16 +400,25 @@ func HasExactValue(matches []Match, value string) bool {
 	return false
 }
 
-func similarityCandidate(value string) bool {
-	return utf8.RuneCountInString(value) >= 24 && countFields(value) >= 5
+func buildSimilarityMeta(value string) (entryMeta, bool) {
+	runeCount, fieldCount := similarityStats(value)
+	if runeCount < 24 || fieldCount < 5 {
+		return entryMeta{}, false
+	}
+	return entryMeta{
+		words:     wordSet(value),
+		runeCount: runeCount,
+	}, true
 }
 
-// countFields counts whitespace-separated fields without allocating, matching
-// the semantics of len(strings.Fields(value)) on the hot similarity path.
-func countFields(value string) int {
+// similarityStats counts runes and whitespace-separated fields in one pass,
+// matching utf8.RuneCountInString plus len(strings.Fields(value)).
+func similarityStats(value string) (int, int) {
+	runeCount := 0
 	count := 0
 	inField := false
 	for _, r := range value {
+		runeCount++
 		if unicode.IsSpace(r) {
 			inField = false
 			continue
@@ -412,7 +428,7 @@ func countFields(value string) int {
 			count++
 		}
 	}
-	return count
+	return runeCount, count
 }
 
 type similarityDetailsResult struct {
@@ -491,10 +507,21 @@ func wordOverlapRatioWithWords(aWords map[string]bool, bWords map[string]bool) f
 
 func wordSet(value string) map[string]bool {
 	out := map[string]bool{}
-	for _, word := range strings.FieldsFunc(value, func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
-	}) {
-		out[word] = true
+	start := -1
+	for i, r := range value {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			if start < 0 {
+				start = i
+			}
+			continue
+		}
+		if start >= 0 {
+			out[value[start:i]] = true
+			start = -1
+		}
+	}
+	if start >= 0 {
+		out[value[start:]] = true
 	}
 	return out
 }
