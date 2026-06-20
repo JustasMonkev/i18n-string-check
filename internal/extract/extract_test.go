@@ -36,6 +36,15 @@ func TestStaticTemplateExtracted(t *testing.T) {
 	requireOneLiteral(t, literals, "Sign in")
 }
 
+func TestModernModuleExtensionsUseMatchingParsers(t *testing.T) {
+	for _, name := range []string{"module.mts", "module.cts", "module.mjs", "module.cjs"} {
+		t.Run(name, func(t *testing.T) {
+			literals := extractSource(t, name, `const label = "Sign in";`, 8)
+			requireOneLiteral(t, literals, "Sign in")
+		})
+	}
+}
+
 func TestCaseVariantExtractedWithNormalizedValue(t *testing.T) {
 	literals := extractSource(t, "case.tsx", `const label = "SIGN IN";`, 8)
 	requireOneLiteral(t, literals, "SIGN IN")

@@ -29,6 +29,24 @@ func TestRunExitCodeNoFindings(t *testing.T) {
 	}
 }
 
+func TestRunScansModernNodeModuleExtensionsByDefault(t *testing.T) {
+	dir := fixtureProjectWithFiles(t, `{"login.button":"Sign in"}`, map[string]string{
+		"esm.mts":    `const label = "Sign in";`,
+		"cjs.cts":    `const label = "Sign in";`,
+		"script.mjs": `const label = "Sign in";`,
+		"script.cjs": `const label = "Sign in";`,
+	})
+	code, output := runBinary(t, dir, filepath.Join(dir, "en.json"), filepath.Join(dir, "src"))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1; output:\n%s", code, output)
+	}
+	for _, want := range []string{"esm.mts", "cjs.cts", "script.mjs", "script.cjs"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output missing %q:\n%s", want, output)
+		}
+	}
+}
+
 func TestRunTestModeAllowsExactDirectString(t *testing.T) {
 	dir := fixtureProject(t, `"Sign in"`)
 	code, output := runBinary(t, dir, filepath.Join(dir, "en.json"), filepath.Join(dir, "src"), "--mode=test")

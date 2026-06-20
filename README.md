@@ -62,7 +62,7 @@ i18n-string-check ./locales/en.json ./src
 i18n-string-check ./locales/en.json ./src --similarity-flow
 i18n-string-check ./locales/en.json ./tests --mode=test
 i18n-string-check ./apps/web/locales/en.json ./apps/web --min-length=8
-i18n-string-check ./en.json ./tests --ext=ts,tsx
+i18n-string-check ./en.json ./tests --ext=ts,tsx,mts
 ```
 
 Flags:
@@ -77,9 +77,9 @@ Flags:
     Ignore literals shorter than N chars after trimming.
     Default: 8
 
---ext=ts,tsx,js,jsx
+--ext=ts,tsx,mts,cts,js,jsx,mjs,cjs
     Comma-separated extensions to scan.
-    Default: ts,tsx,js,jsx
+    Default: ts,tsx,mts,cts,js,jsx,mjs,cjs
 
 --exclude=pattern
     Glob pattern to exclude.

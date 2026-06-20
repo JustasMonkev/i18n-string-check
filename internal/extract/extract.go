@@ -230,7 +230,7 @@ func ignoreMarkerLines(content []byte) []bool {
 
 func languageForPath(path string) (*sitter.Language, *langSupport, error) {
 	switch strings.ToLower(filepath.Ext(path)) {
-	case ".ts":
+	case ".ts", ".mts", ".cts":
 		ls, err := typescriptSupport()
 		return typescript.GetLanguage(), ls, err
 	case ".tsx", ".jsx":

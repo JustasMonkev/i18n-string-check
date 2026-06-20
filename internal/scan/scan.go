@@ -66,7 +66,7 @@ func DiscoverFiles(root string, opts Options) ([]string, error) {
 
 func normalizeExtensions(exts []string) map[string]bool {
 	if len(exts) == 0 {
-		exts = []string{"ts", "tsx", "js", "jsx"}
+		exts = []string{"ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"}
 	}
 	out := map[string]bool{}
 	for _, ext := range exts {

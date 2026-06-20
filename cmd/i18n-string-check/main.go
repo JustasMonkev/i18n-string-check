@@ -167,7 +167,7 @@ func parseArgs(args []string, output io.Writer) (config, error) {
 func defaultConfig() config {
 	return config{
 		minLength: 8,
-		exts:      []string{"ts", "tsx", "js", "jsx"},
+		exts:      []string{"ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"},
 		mode:      modeSource,
 	}
 }
@@ -257,9 +257,9 @@ Flags:
       Ignore literals shorter than N chars after trimming.
       Default: 8
 
-  --ext=ts,tsx,js,jsx
+  --ext=ts,tsx,mts,cts,js,jsx,mjs,cjs
       Comma-separated extensions to scan.
-      Default: ts,tsx,js,jsx
+      Default: ts,tsx,mts,cts,js,jsx,mjs,cjs
 
   --exclude=pattern
       Glob pattern to exclude.
