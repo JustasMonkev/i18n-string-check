@@ -343,6 +343,52 @@ type fileResult struct {
 	err      error
 }
 
+// matchCache runs the per-literal match pipeline for one scan; mode and
+// similarityFlow are fixed for its lifetime. Exact and pattern lookups are
+// cheap enough to redo per occurrence, but similarity results are memoized:
+// literals repeat across a codebase and a similarity lookup walks posting
+// lists. Cached match slices are shared between findings and must not be
+// mutated.
+type matchCache struct {
+	similar        sync.Map
+	idx            *i18nindex.Index
+	mode           string
+	similarityFlow bool
+}
+
+// lookup returns the matches for a normalized literal and the finding type
+// they carry, mirroring the exact -> pattern -> similarity precedence.
+func (c *matchCache) lookup(normalized string) ([]i18nindex.Match, string) {
+	if matches := c.idx.LookupNormalized(normalized); len(matches) > 0 {
+		return matches, "hardcoded-translation"
+	}
+	if c.mode != modeSource {
+		return nil, ""
+	}
+	if matches := c.idx.LookupPatternNormalized(normalized); len(matches) > 0 {
+		return matches, "hardcoded-translation"
+	}
+	if !c.similarityFlow {
+		return nil, ""
+	}
+	return c.lookupSimilar(normalized), "changed-translation-value"
+}
+
+func (c *matchCache) lookupSimilar(normalized string) []i18nindex.Match {
+	if cached, ok := c.similar.Load(normalized); ok {
+		matches, _ := cached.([]i18nindex.Match)
+		return matches
+	}
+	matches := c.idx.LookupSimilarNormalized(normalized)
+	c.similar.Store(normalized, matches)
+	return matches
+}
+
+func (c *matchCache) worth(normalized string) bool {
+	matches, _ := c.lookup(normalized)
+	return len(matches) > 0
+}
+
 func scanAndMatch(files []string, minLength int, idx *i18nindex.Index, mode string, similarityFlow bool) ([]report.Finding, error) {
 	if len(files) == 0 {
 		return nil, nil
@@ -351,6 +397,7 @@ func scanAndMatch(files []string, minLength int, idx *i18nindex.Index, mode stri
 	if workers > len(files) {
 		workers = len(files)
 	}
+	cache := &matchCache{idx: idx, mode: mode, similarityFlow: similarityFlow}
 
 	jobs := make(chan string, len(files))
 	results := make(chan fileResult, len(files))
@@ -361,7 +408,7 @@ func scanAndMatch(files []string, minLength int, idx *i18nindex.Index, mode stri
 		go func() {
 			defer wg.Done()
 			for file := range jobs {
-				results <- scanOne(file, minLength, idx, mode, similarityFlow)
+				results <- scanOne(file, minLength, mode, cache)
 			}
 		}()
 	}
@@ -392,24 +439,24 @@ func scanAndMatch(files []string, minLength int, idx *i18nindex.Index, mode stri
 	return findings, nil
 }
 
-func scanOne(path string, minLength int, idx *i18nindex.Index, mode string, similarityFlow bool) fileResult {
-	literals, err := extract.File(path, minLength)
+func scanOne(path string, minLength int, mode string, cache *matchCache) fileResult {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return fileResult{err: err}
+	}
+	// The pre-scan checks a cheap lexical superset of the file's literals
+	// against the index. Files without a single matching candidate — the
+	// common case — provably have no findings and skip parsing entirely.
+	if !extract.HasCandidateMatch(path, content, minLength, cache.worth) {
+		return fileResult{}
+	}
+	literals, err := extract.BytesFiltered(path, content, minLength, cache.worth)
 	if err != nil {
 		return fileResult{err: err}
 	}
 	var findings []report.Finding
 	for _, literal := range literals {
-		// literal.NormalizedLiteral was already computed during extraction;
-		// reuse it instead of re-normalizing the literal in each lookup.
-		matches := idx.LookupNormalized(literal.NormalizedLiteral)
-		findingType := "hardcoded-translation"
-		if len(matches) == 0 && mode == modeSource {
-			matches = idx.LookupPatternNormalized(literal.NormalizedLiteral)
-		}
-		if len(matches) == 0 && mode == modeSource && similarityFlow {
-			matches = idx.LookupSimilarNormalized(literal.NormalizedLiteral)
-			findingType = "changed-translation-value"
-		}
+		matches, findingType := cache.lookup(literal.NormalizedLiteral)
 		if len(matches) == 0 {
 			continue
 		}
