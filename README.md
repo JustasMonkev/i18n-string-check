@@ -107,6 +107,10 @@ Flags:
 2  IO error / parse error / bad args / malformed en.json
 ```
 
+Files are only parsed when a fast pre-scan finds a string that could match a
+translation, so a file with syntax errors is reported (exit `2`) only if it
+also contains a potential match; clean files are skipped without parsing.
+
 ## CI Usage
 
 Run it before slower browser or E2E jobs:

@@ -37,6 +37,10 @@ var benchPhrases = []string{
 }
 
 func buildBenchCorpus(tb testing.TB, fileCount int) *benchCorpus {
+	return buildBenchCorpusWithFindings(tb, fileCount, true)
+}
+
+func buildBenchCorpusWithFindings(tb testing.TB, fileCount int, withFindings bool) *benchCorpus {
 	tb.Helper()
 	root := tb.TempDir()
 
@@ -71,10 +75,10 @@ func buildBenchCorpus(tb testing.TB, fileCount int) *benchCorpus {
 		switch i % 3 {
 		case 0:
 			path = filepath.Join(srcDir, "components", fmt.Sprintf("Component%d.tsx", i))
-			content = benchTSX(i)
+			content = benchTSX(i, withFindings)
 		case 1:
 			path = filepath.Join(srcDir, fmt.Sprintf("module%d.ts", i))
-			content = benchTS(i)
+			content = benchTS(i, withFindings)
 		default:
 			path = filepath.Join(srcDir, fmt.Sprintf("legacy%d.js", i))
 			content = benchJS(i)
@@ -92,7 +96,7 @@ func buildBenchCorpus(tb testing.TB, fileCount int) *benchCorpus {
 	return &benchCorpus{root: root, enJSON: enJSON, files: files, index: idx}
 }
 
-func benchTSX(seed int) string {
+func benchTSX(seed int, withFindings bool) string {
 	phrase := benchPhrases[seed%len(benchPhrases)]
 	var b strings.Builder
 	b.WriteString("import React from 'react';\nimport { t } from '../i18n';\n\n")
@@ -100,7 +104,7 @@ func benchTSX(seed int) string {
 	for j := 0; j < 30; j++ {
 		fmt.Fprintf(&b, "      <section data-testid=\"section-%d\">\n", j)
 		fmt.Fprintf(&b, "        <h2 title=\"Heading number %d for layout\">{t('section%d.title')}</h2>\n", j, j%10)
-		if j%5 == 0 {
+		if j%5 == 0 && withFindings {
 			fmt.Fprintf(&b, "        <p>%s</p>\n", phrase)
 		} else {
 			fmt.Fprintf(&b, "        <p>Static layout copy block %d-%d that should not match anything</p>\n", seed, j)
@@ -113,7 +117,7 @@ func benchTSX(seed int) string {
 	return b.String()
 }
 
-func benchTS(seed int) string {
+func benchTS(seed int, withFindings bool) string {
 	var b strings.Builder
 	b.WriteString("import { logger } from './logger';\n\n")
 	fmt.Fprintf(&b, "export const config%d = {\n", seed)
@@ -124,7 +128,7 @@ func benchTS(seed int) string {
 	for j := 0; j < 40; j++ {
 		fmt.Fprintf(&b, "export function helper%d(input: string): string {\n", j)
 		fmt.Fprintf(&b, "  logger.debug('processing helper %d with input', input);\n", j)
-		if j%7 == 0 {
+		if j%7 == 0 && withFindings {
 			fmt.Fprintf(&b, "  return 'Translation value number %d for the benchmark corpus';\n", j)
 		} else {
 			fmt.Fprintf(&b, "  return `template result %d ` + input;\n", j)
@@ -182,13 +186,57 @@ func BenchmarkPipelineSimilarity(b *testing.B) {
 	}
 }
 
+// BenchmarkPipelineClean measures the common CI case: a project whose source
+// contains no hardcoded translations, so every file can be cleared by the
+// fast pre-scan without parsing.
+func BenchmarkPipelineClean(b *testing.B) {
+	corpus := buildBenchCorpusWithFindings(b, 120, false)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		files, err := scan.DiscoverFiles(filepath.Join(corpus.root, "src"), scan.Options{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		findings, err := scanAndMatch(files, 8, corpus.index, modeSource, false)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(findings) != 0 {
+			b.Fatal("expected no findings")
+		}
+	}
+}
+
+// BenchmarkPipelineCleanSimilarity is the clean-project pipeline with
+// --similarity-flow enabled.
+func BenchmarkPipelineCleanSimilarity(b *testing.B) {
+	corpus := buildBenchCorpusWithFindings(b, 120, false)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		files, err := scan.DiscoverFiles(filepath.Join(corpus.root, "src"), scan.Options{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		findings, err := scanAndMatch(files, 8, corpus.index, modeSource, true)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(findings) != 0 {
+			b.Fatal("expected no findings")
+		}
+	}
+}
+
 // BenchmarkScanOne measures a single file scan (extraction + matching) on the
 // largest generated file type, isolating per-file cost from the worker pool.
 func BenchmarkScanOne(b *testing.B) {
 	corpus := buildBenchCorpus(b, 3)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		result := scanOne(corpus.files[0], 8, corpus.index, modeSource, false)
+		// A fresh cache per iteration keeps the measurement honest: nothing
+		// is memoized across iterations.
+		cache := &matchCache{idx: corpus.index, mode: modeSource}
+		result := scanOne(corpus.files[0], 8, modeSource, cache)
 		if result.err != nil {
 			b.Fatal(result.err)
 		}
