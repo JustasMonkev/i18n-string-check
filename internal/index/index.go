@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 
 	"github.com/justasmonkev/i18n-string-check/internal/normalize"
@@ -25,16 +26,42 @@ type Index struct {
 	entries  map[string][]Match
 	patterns []patternMatch
 	all      []Match
-	// meta holds precomputed similarity data aligned with all; it is only
-	// populated for similarity candidates so lookups never re-tokenize or
-	// re-count entry values.
-	meta           []entryMeta
-	similarByToken map[string][]int
+	sim      simIndex
 }
 
-type entryMeta struct {
-	words     map[string]bool
-	runeCount int
+// simIndex holds the similarity-matching data: tokens interned to dense ids,
+// an inverted index from token id to eligible entries, and pooled per-query
+// scratch buffers. Word overlap is computed by counting posting hits per
+// candidate instead of intersecting per-entry word-set maps, so a lookup
+// never iterates or hashes candidate word sets.
+type simIndex struct {
+	// entriesMeta is aligned with Index.all; tokenCount is zero for entries
+	// that are not similarity candidates.
+	entriesMeta []simEntryMeta
+	vocab       map[string]int32
+	// postings maps a token id to the similarity-eligible entries containing
+	// that token. Candidate discovery only walks tokens of length >= 3;
+	// shorter tokens are indexed so overlap counts stay exact.
+	postings [][]int32
+	scratch  sync.Pool
+}
+
+type simEntryMeta struct {
+	runeCount  int32
+	tokenCount int32
+}
+
+// simScratch is the reusable per-query state. counts is indexed by entry:
+// 0 untouched, -1 rejected by the length filter, otherwise the number of
+// shared tokens so far. touched lists the entries to reset after the query.
+type simScratch struct {
+	counts    []int32
+	touched   []int32
+	longIDs   []int32
+	shortIDs  []int32
+	tokenSeen []uint32
+	epoch     uint32
+	unknown   []string
 }
 
 type patternMatch struct {
@@ -59,15 +86,29 @@ func FromBytes(content []byte, minLength int) (*Index, error) {
 		return nil, err
 	}
 
-	idx := &Index{entries: map[string][]Match{}, similarByToken: map[string][]int{}}
+	idx := &Index{entries: map[string][]Match{}, sim: simIndex{vocab: map[string]int32{}}}
 	for key, value := range raw {
 		if normalize.TrimmedLength(value) < minLength {
 			continue
 		}
 		idx.add(key, value)
 	}
+	idx.finalizeSimilarity()
 
 	return idx, nil
+}
+
+// finalizeSimilarity sizes the pooled query scratch to the finished index.
+// It must run after the last add.
+func (i *Index) finalizeSimilarity() {
+	entryCount := len(i.all)
+	vocabSize := len(i.sim.vocab)
+	i.sim.scratch.New = func() any {
+		return &simScratch{
+			counts:    make([]int32, entryCount),
+			tokenSeen: make([]uint32, vocabSize),
+		}
+	}
 }
 
 func parseTranslations(content []byte) (map[string]string, error) {
@@ -101,7 +142,7 @@ func flattenTranslations(prefix string, raw map[string]any, flat map[string]stri
 
 func (i *Index) add(key string, value string) {
 	normalized := normalize.Normalize(value)
-	index := len(i.all)
+	index := int32(len(i.all))
 	match := Match{
 		Key:             key,
 		Value:           value,
@@ -109,20 +150,24 @@ func (i *Index) add(key string, value string) {
 	}
 	i.entries[normalized] = append(i.entries[normalized], match)
 	i.all = append(i.all, match)
-	var meta entryMeta
-	if similarityMeta, ok := buildSimilarityMeta(normalized); ok {
-		meta = similarityMeta
-		for word := range meta.words {
-			if len(word) >= 3 {
-				i.similarByToken[word] = append(i.similarByToken[word], index)
+	var meta simEntryMeta
+	if runeCount, ok := similarityEligible(normalized); ok {
+		words := wordSet(normalized)
+		meta = simEntryMeta{runeCount: int32(runeCount), tokenCount: int32(len(words))}
+		for word := range words {
+			id, ok := i.sim.vocab[word]
+			if !ok {
+				id = int32(len(i.sim.postings))
+				i.sim.vocab[word] = id
+				i.sim.postings = append(i.sim.postings, nil)
 			}
+			i.sim.postings[id] = append(i.sim.postings[id], index)
 		}
 	}
-	i.meta = append(i.meta, meta)
+	i.sim.entriesMeta = append(i.sim.entriesMeta, meta)
 	for _, template := range translationPatternTemplates(value) {
-		pattern, ok := compileTranslationPattern(template)
+		pattern, prefix, ok := compileTranslationPattern(template)
 		if ok {
-			prefix, _ := pattern.LiteralPrefix()
 			i.patterns = append(i.patterns, patternMatch{match: match, pattern: pattern, prefix: prefix})
 		}
 	}
@@ -192,19 +237,66 @@ func (i *Index) LookupSimilarNormalized(normalized string) []Match {
 	if i == nil {
 		return nil
 	}
-	queryMeta, ok := buildSimilarityMeta(normalized)
+	queryRunes, ok := similarityEligible(normalized)
 	if !ok {
 		return nil
 	}
-	candidateIndexes := i.similarCandidateIndexes(queryMeta.runeCount, queryMeta.words)
+	scratch := i.sim.scratch.Get().(*simScratch)
+	scratch.collectQueryTokens(normalized, i.sim.vocab)
+	// Without a shared token of length >= 3 there can be no candidates, so
+	// most non-translation strings stop here before any counting work.
+	if len(scratch.longIDs) == 0 {
+		i.sim.scratch.Put(scratch)
+		return nil
+	}
+	queryTokens := len(scratch.longIDs) + len(scratch.shortIDs) + countUnique(scratch.unknown)
+
+	// Discovery walks the postings of tokens with length >= 3, counting
+	// shared tokens per entry; the length-ratio filter runs once per entry
+	// on first touch. Short-token postings then top up the counts of already
+	// discovered candidates so overlap ratios match full word-set
+	// intersection.
+	for _, id := range scratch.longIDs {
+		for _, entry := range i.sim.postings[id] {
+			switch count := scratch.counts[entry]; {
+			case count > 0:
+				scratch.counts[entry] = count + 1
+			case count == 0:
+				if likelySimilarLength(queryRunes, int(i.sim.entriesMeta[entry].runeCount)) {
+					scratch.counts[entry] = 1
+				} else {
+					scratch.counts[entry] = -1
+				}
+				scratch.touched = append(scratch.touched, entry)
+			}
+		}
+	}
+	for _, id := range scratch.shortIDs {
+		for _, entry := range i.sim.postings[id] {
+			if scratch.counts[entry] > 0 {
+				scratch.counts[entry]++
+			}
+		}
+	}
+
 	var matches []Match
-	for _, candidateIndex := range candidateIndexes {
-		match := i.all[candidateIndex]
+	for _, entry := range scratch.touched {
+		shared := scratch.counts[entry]
+		scratch.counts[entry] = 0
+		if shared <= 0 {
+			continue
+		}
+		match := i.all[entry]
 		if normalized == match.NormalizedValue {
 			continue
 		}
-		meta := i.meta[candidateIndex]
-		details, ok := similarityDetailsPrecomputed(normalized, queryMeta.runeCount, queryMeta.words, match.NormalizedValue, meta.runeCount, meta.words)
+		meta := i.sim.entriesMeta[entry]
+		denominator := queryTokens
+		if int(meta.tokenCount) > denominator {
+			denominator = int(meta.tokenCount)
+		}
+		overlap := float64(shared) / float64(denominator)
+		details, ok := similarityDetails(normalized, queryRunes, match.NormalizedValue, int(meta.runeCount), overlap)
 		if ok {
 			match.Reason = details.Reason
 			match.Score = details.Score
@@ -212,6 +304,9 @@ func (i *Index) LookupSimilarNormalized(normalized string) []Match {
 			matches = append(matches, match)
 		}
 	}
+	scratch.touched = scratch.touched[:0]
+	i.sim.scratch.Put(scratch)
+
 	sort.Slice(matches, func(i, j int) bool {
 		if matches[i].Score != matches[j].Score {
 			return matches[i].Score > matches[j].Score
@@ -224,36 +319,65 @@ func (i *Index) LookupSimilarNormalized(normalized string) []Match {
 	return matches
 }
 
-func (i *Index) similarCandidateIndexes(queryRunes int, words map[string]bool) []int {
-	var seen map[int]bool
-	for word := range words {
-		if len(word) < 3 {
+// collectQueryTokens splits the query into the tokens wordSet would produce.
+// Tokens known to the index vocabulary are deduplicated into longIDs/shortIDs
+// (split at the 3-byte candidate-discovery cutoff); unknown tokens are stashed
+// in unknown, still with duplicates, for the overlap denominator count.
+func (s *simScratch) collectQueryTokens(normalized string, vocab map[string]int32) {
+	s.epoch++
+	s.longIDs = s.longIDs[:0]
+	s.shortIDs = s.shortIDs[:0]
+	s.unknown = s.unknown[:0]
+	appendToken := func(token string) {
+		if id, ok := vocab[token]; ok {
+			if s.tokenSeen[id] == s.epoch {
+				return
+			}
+			s.tokenSeen[id] = s.epoch
+			if len(token) >= 3 {
+				s.longIDs = append(s.longIDs, id)
+			} else {
+				s.shortIDs = append(s.shortIDs, id)
+			}
+			return
+		}
+		s.unknown = append(s.unknown, token)
+	}
+	start := -1
+	for i, r := range normalized {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			if start < 0 {
+				start = i
+			}
 			continue
 		}
-		tokenIndexes := i.similarByToken[word]
-		if len(tokenIndexes) == 0 {
-			continue
+		if start >= 0 {
+			appendToken(normalized[start:i])
+			start = -1
 		}
-		if seen == nil {
-			seen = make(map[int]bool, len(tokenIndexes))
-		}
-		for _, index := range tokenIndexes {
-			if !seen[index] && likelySimilarLength(queryRunes, i.meta[index].runeCount) {
-				seen[index] = true
+	}
+	if start >= 0 {
+		appendToken(normalized[start:])
+	}
+}
+
+// countUnique counts distinct strings with a quadratic scan; queries carry at
+// most a handful of unknown tokens, so this beats hashing them into a map.
+func countUnique(tokens []string) int {
+	unique := 0
+	for i, token := range tokens {
+		duplicate := false
+		for _, previous := range tokens[:i] {
+			if previous == token {
+				duplicate = true
+				break
 			}
 		}
+		if !duplicate {
+			unique++
+		}
 	}
-	if len(seen) == 0 {
-		return nil
-	}
-	indexes := make([]int, 0, len(seen))
-	for index := range seen {
-		indexes = append(indexes, index)
-	}
-	if len(indexes) > 1 {
-		sort.Ints(indexes)
-	}
-	return indexes
+	return unique
 }
 
 func likelySimilarLength(aLen int, bLen int) bool {
@@ -264,7 +388,8 @@ func likelySimilarLength(aLen int, bLen int) bool {
 	if shorter > longer {
 		shorter, longer = longer, shorter
 	}
-	return float64(shorter)/float64(longer) >= 0.5
+	// Integer form of shorter/longer >= 0.5, avoiding the division.
+	return 2*shorter >= longer
 }
 
 func translationPatternTemplates(value string) []string {
@@ -275,9 +400,16 @@ func translationPatternTemplates(value string) []string {
 	return []string{value}
 }
 
-func compileTranslationPattern(template string) (*regexp.Regexp, bool) {
+// compileTranslationPattern also returns the pattern's literal prefix (the
+// normalized text before the first placeholder), which the lookup uses to
+// skip the regex engine. It is computed here because
+// regexp.(*Regexp).LiteralPrefix returns an empty prefix for anchored
+// patterns, which would disable that guard.
+func compileTranslationPattern(template string) (*regexp.Regexp, string, bool) {
 	normalized := normalize.Normalize(template)
 	var out strings.Builder
+	var prefix strings.Builder
+	prefixDone := false
 	out.WriteString("^")
 	placeholderCount := 0
 	literalCount := 0
@@ -287,21 +419,29 @@ func compileTranslationPattern(template string) (*regexp.Regexp, bool) {
 			end := strings.IndexByte(normalized[i+1:], '}')
 			if end < 0 {
 				out.WriteString(regexp.QuoteMeta(normalized[i : i+1]))
+				if !prefixDone {
+					prefix.WriteByte(normalized[i])
+				}
 				literalCount++
 				continue
 			}
 			content := normalized[i+1 : i+1+end]
 			if content == "" || strings.Contains(content, ",") || strings.ContainsAny(content, "{}") {
-				return nil, false
+				return nil, "", false
 			}
 			out.WriteString(".+")
+			prefixDone = true
 			placeholderCount++
 			i += end + 1
 		case '#':
 			out.WriteString(`\d+`)
+			prefixDone = true
 			placeholderCount++
 		default:
 			out.WriteString(regexp.QuoteMeta(normalized[i : i+1]))
+			if !prefixDone {
+				prefix.WriteByte(normalized[i])
+			}
 			if isPatternLiteral(normalized[i]) {
 				literalCount++
 			}
@@ -309,13 +449,13 @@ func compileTranslationPattern(template string) (*regexp.Regexp, bool) {
 	}
 	out.WriteString("$")
 	if placeholderCount == 0 || literalCount < 3 {
-		return nil, false
+		return nil, "", false
 	}
 	pattern, err := regexp.Compile(out.String())
 	if err != nil {
-		return nil, false
+		return nil, "", false
 	}
-	return pattern, true
+	return pattern, prefix.String(), true
 }
 
 func isPatternLiteral(char byte) bool {
@@ -400,20 +540,44 @@ func HasExactValue(matches []Match, value string) bool {
 	return false
 }
 
-func buildSimilarityMeta(value string) (entryMeta, bool) {
+// similarityEligible reports whether a value is long enough for similarity
+// matching (>= 24 runes and >= 5 whitespace fields) and returns its rune
+// count.
+func similarityEligible(value string) (int, bool) {
 	runeCount, fieldCount := similarityStats(value)
 	if runeCount < 24 || fieldCount < 5 {
-		return entryMeta{}, false
+		return 0, false
 	}
-	return entryMeta{
-		words:     wordSet(value),
-		runeCount: runeCount,
-	}, true
+	return runeCount, true
 }
 
 // similarityStats counts runes and whitespace-separated fields in one pass,
-// matching utf8.RuneCountInString plus len(strings.Fields(value)).
+// matching utf8.RuneCountInString plus len(strings.Fields(value)). ASCII
+// input, the overwhelmingly common case, is handled byte-wise without rune
+// decoding.
 func similarityStats(value string) (int, int) {
+	runeCount := 0
+	count := 0
+	inField := false
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		if b >= 0x80 {
+			return similarityStatsRunes(value)
+		}
+		runeCount++
+		if b == ' ' || ('\t' <= b && b <= '\r') {
+			inField = false
+			continue
+		}
+		if !inField {
+			inField = true
+			count++
+		}
+	}
+	return runeCount, count
+}
+
+func similarityStatsRunes(value string) (int, int) {
 	runeCount := 0
 	count := 0
 	inField := false
@@ -437,13 +601,13 @@ type similarityDetailsResult struct {
 	Why    string
 }
 
-// similarityDetailsPrecomputed reports how similar query a is to candidate b.
-// Both sides are already known to be similarity candidates, and word sets and
-// rune counts are precomputed so the per-candidate cost stays low. The
+// similarityDetails reports how similar query a is to candidate b. Both sides
+// are already known to be similarity candidates, rune counts are precomputed,
+// and the word overlap ratio was already derived from posting counts. The
 // expensive Levenshtein distance only runs when the cheap word-overlap and
 // length-ratio bounds show its threshold is still reachable: the edit
 // similarity can never exceed shorterLen/longerLen.
-func similarityDetailsPrecomputed(a string, aRunes int, aWords map[string]bool, b string, bRunes int, bWords map[string]bool) (similarityDetailsResult, bool) {
+func similarityDetails(a string, aRunes int, b string, bRunes int, wordOverlap float64) (similarityDetailsResult, bool) {
 	shorter, longer := a, b
 	shorterLen, longerLen := aRunes, bRunes
 	bIsLonger := true
@@ -453,7 +617,6 @@ func similarityDetailsPrecomputed(a string, aRunes int, aWords map[string]bool, 
 		bIsLonger = false
 	}
 	lengthRatio := float64(shorterLen) / float64(longerLen)
-	wordOverlap := wordOverlapRatioWithWords(aWords, bWords)
 	if lengthRatio >= 0.65 && strings.Contains(longer, shorter) {
 		score := maxFloat(wordOverlap, lengthRatio)
 		why := fmt.Sprintf("%d%% word overlap", percent(wordOverlap))
@@ -486,23 +649,6 @@ func similarityDetailsPrecomputed(a string, aRunes int, aWords map[string]bool, 
 		}, true
 	}
 	return similarityDetailsResult{}, false
-}
-
-func wordOverlapRatioWithWords(aWords map[string]bool, bWords map[string]bool) float64 {
-	if len(aWords) == 0 || len(bWords) == 0 {
-		return 0
-	}
-	intersection := 0
-	for word := range aWords {
-		if bWords[word] {
-			intersection++
-		}
-	}
-	denominator := len(aWords)
-	if len(bWords) > denominator {
-		denominator = len(bWords)
-	}
-	return float64(intersection) / float64(denominator)
 }
 
 func wordSet(value string) map[string]bool {

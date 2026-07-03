@@ -35,6 +35,11 @@ func File(path string, minLength int) ([]Literal, error) {
 	return Bytes(path, content, minLength)
 }
 
+// MatchFunc reports whether a normalized literal is worth keeping. It lets
+// callers that only care about literals matching an index skip the expensive
+// per-literal context filters (cgo ancestor walks) for everything else.
+type MatchFunc func(normalized string) bool
+
 var parserPool = sync.Pool{
 	New: func() any { return sitter.NewParser() },
 }
@@ -154,6 +159,13 @@ var (
 )
 
 func Bytes(path string, content []byte, minLength int) ([]Literal, error) {
+	return BytesFiltered(path, content, minLength, nil)
+}
+
+// BytesFiltered is Bytes with an optional worth filter: literals whose
+// normalized form fails the filter are dropped before the context checks run.
+// A nil filter keeps every literal, matching Bytes.
+func BytesFiltered(path string, content []byte, minLength int, worth MatchFunc) ([]Literal, error) {
 	language, ls, err := languageForPath(path)
 	if err != nil {
 		return nil, err
@@ -176,6 +188,7 @@ func Bytes(path string, content []byte, minLength int) ([]Literal, error) {
 		minLength:   minLength,
 		path:        path,
 		lang:        ls,
+		worth:       worth,
 		ignoreLines: ignoreMarkerLines(content),
 	}
 
@@ -208,6 +221,7 @@ type walker struct {
 	minLength int
 	path      string
 	lang      *langSupport
+	worth     MatchFunc
 	// ignoreLines marks zero-based rows that contain the inline ignore marker.
 	// It is nil when the marker is absent from the file (the common case).
 	ignoreLines []bool
@@ -273,8 +287,12 @@ func (w *walker) visit(kind literalKind, node *sitter.Node) {
 	if normalized == "" {
 		return
 	}
-	// Context checks walk the ancestor chain through cgo, so run them only
-	// after the literal has survived the cheap length filter above.
+	// The worth filter runs before the context checks: matching against the
+	// index is a hash lookup, while the context checks walk the ancestor
+	// chain through cgo, so uninteresting literals never pay for that walk.
+	if w.worth != nil && !w.worth(normalized) {
+		return
+	}
 	if kind == kindString && !w.shouldScanString(node) {
 		return
 	}
