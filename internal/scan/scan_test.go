@@ -25,6 +25,27 @@ func TestDiscoverFilesFiltersExtensionsAndExcludes(t *testing.T) {
 	}
 }
 
+func TestDiscoverFilesSkipsSymlinkedFiles(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "src/a.ts", "")
+	outside := filepath.Join(t.TempDir(), "outside.ts")
+	if err := os.WriteFile(outside, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "src/leak.ts")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks are not supported: %v", err)
+	}
+
+	files, err := DiscoverFiles(root, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || filepath.Base(files[0]) != "a.ts" {
+		t.Fatalf("DiscoverFiles() = %#v, want only a.ts", files)
+	}
+}
+
 func writeFile(t *testing.T, root string, name string, content string) {
 	t.Helper()
 	path := filepath.Join(root, name)

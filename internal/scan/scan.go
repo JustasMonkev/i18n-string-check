@@ -48,6 +48,9 @@ func DiscoverFiles(root string, opts Options) ([]string, error) {
 			}
 			return nil
 		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			return nil
+		}
 		if d.IsDir() {
 			return nil
 		}
