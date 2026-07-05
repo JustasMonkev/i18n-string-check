@@ -361,23 +361,18 @@ func (s *simScratch) collectQueryTokens(normalized string, vocab map[string]int3
 	}
 }
 
-// countUnique counts distinct strings with a quadratic scan; queries carry at
-// most a handful of unknown tokens, so this beats hashing them into a map.
+// countUnique counts distinct strings in linear time. Query tokens come from
+// source files and can be attacker-controlled, so avoid nested scans that let
+// large literals force quadratic work during similarity pre-scans.
 func countUnique(tokens []string) int {
-	unique := 0
-	for i, token := range tokens {
-		duplicate := false
-		for _, previous := range tokens[:i] {
-			if previous == token {
-				duplicate = true
-				break
-			}
-		}
-		if !duplicate {
-			unique++
-		}
+	if len(tokens) == 0 {
+		return 0
 	}
-	return unique
+	seen := make(map[string]struct{}, len(tokens))
+	for _, token := range tokens {
+		seen[token] = struct{}{}
+	}
+	return len(seen)
 }
 
 func likelySimilarLength(aLen int, bLen int) bool {
