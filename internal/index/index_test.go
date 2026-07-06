@@ -1,6 +1,9 @@
 package index
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+)
 
 func TestIndexCreationAndLookup(t *testing.T) {
 	idx, err := FromBytes([]byte(`{"login.button":"Sign in","common.cancel":"Cancel"}`), 8)
@@ -133,5 +136,18 @@ func TestNestedObjectsFlattenToDotKeys(t *testing.T) {
 		if len(matches) != 1 || matches[0].Key != tt.key {
 			t.Fatalf("Lookup(%q) = %#v, want key %q", tt.value, matches, tt.key)
 		}
+	}
+}
+
+func TestCountUniqueHandlesManyUnknownTokens(t *testing.T) {
+	const tokenCount = 10000
+	tokens := make([]string, 0, tokenCount+2)
+	for i := 0; i < tokenCount; i++ {
+		tokens = append(tokens, "unknown"+strconv.Itoa(i))
+	}
+	tokens = append(tokens, tokens[0], tokens[tokenCount-1])
+
+	if got := countUnique(tokens); got != tokenCount {
+		t.Fatalf("countUnique() = %d, want %d", got, tokenCount)
 	}
 }
