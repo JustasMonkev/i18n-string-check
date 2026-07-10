@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -346,6 +347,12 @@ type fileResult struct {
 func scanAndMatch(files []string, minLength int, idx *i18nindex.Index, mode string, similarityFlow bool) ([]report.Finding, error) {
 	if len(files) == 0 {
 		return nil, nil
+	}
+	// Scans are short-lived and allocation-heavy; collect less often unless
+	// the caller explicitly tuned GOGC.
+	if _, configured := os.LookupEnv("GOGC"); !configured {
+		previousGC := debug.SetGCPercent(400)
+		defer debug.SetGCPercent(previousGC)
 	}
 	workers := runtime.NumCPU()
 	if workers > len(files) {
