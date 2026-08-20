@@ -236,7 +236,7 @@ func ignoreMarkerLines(content []byte) []bool {
 		return nil
 	}
 	var lines []bool
-	for _, line := range bytes.Split(content, []byte("\n")) {
+	for line := range bytes.SplitSeq(content, []byte("\n")) {
 		lines = append(lines, bytes.Contains(line, []byte(ignoreMarker)))
 	}
 	return lines

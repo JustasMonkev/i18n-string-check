@@ -225,11 +225,11 @@ func configPathFromArgs(args []string) (string, bool) {
 			}
 			return "", true
 		}
-		if strings.HasPrefix(arg, "--config=") {
-			return strings.TrimPrefix(arg, "--config="), true
+		if after, ok := strings.CutPrefix(arg, "--config="); ok {
+			return after, true
 		}
-		if strings.HasPrefix(arg, "-config=") {
-			return strings.TrimPrefix(arg, "-config="), true
+		if after, ok := strings.CutPrefix(arg, "-config="); ok {
+			return after, true
 		}
 	}
 	return "", false
@@ -400,24 +400,19 @@ func scanAndMatch(files []string, minLength int, idx *i18nindex.Index, mode stri
 		previousGC := debug.SetGCPercent(400)
 		defer debug.SetGCPercent(previousGC)
 	}
-	workers := runtime.NumCPU()
-	if workers > len(files) {
-		workers = len(files)
-	}
+	workers := min(runtime.NumCPU(), len(files))
 	cache := &matchCache{idx: idx, mode: mode, similarityFlow: similarityFlow}
 
 	jobs := make(chan string, len(files))
 	results := make(chan fileResult, len(files))
 	var wg sync.WaitGroup
 
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range workers {
+		wg.Go(func() {
 			for file := range jobs {
 				results <- scanOne(file, minLength, mode, cache)
 			}
-		}()
+		})
 	}
 
 	for _, file := range files {

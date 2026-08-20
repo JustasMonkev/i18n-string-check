@@ -13,13 +13,21 @@ import (
 	"github.com/justasmonkev/i18n-string-check/internal/normalize"
 )
 
+// Detail explains why a pattern or similarity lookup reported a match. It is
+// embedded in Match, so its fields stay addressable as flat keys in Match
+// literals (Go 1.27 promoted fields in struct literals) and flat properties in
+// the JSON output.
+type Detail struct {
+	Reason string  `json:"reason,omitempty"`
+	Score  float64 `json:"score,omitempty"`
+	Why    string  `json:"why,omitempty"`
+}
+
 type Match struct {
-	Key             string  `json:"key"`
-	Value           string  `json:"value"`
-	NormalizedValue string  `json:"-"`
-	Reason          string  `json:"reason,omitempty"`
-	Score           float64 `json:"score,omitempty"`
-	Why             string  `json:"why,omitempty"`
+	Key             string `json:"key"`
+	Value           string `json:"value"`
+	NormalizedValue string `json:"-"`
+	Detail
 }
 
 type Index struct {
@@ -215,9 +223,11 @@ func (i *Index) LookupPatternNormalized(normalized string) []Match {
 		}
 		if candidate.pattern.MatchString(normalized) {
 			match := candidate.match
-			match.Reason = "translation-pattern"
-			match.Score = 1
-			match.Why = "source string matches the current translation pattern"
+			match.Detail = Detail{
+				Reason: "translation-pattern",
+				Score:  1,
+				Why:    "source string matches the current translation pattern",
+			}
 			matches = append(matches, match)
 		}
 	}
@@ -291,16 +301,11 @@ func (i *Index) LookupSimilarNormalized(normalized string) []Match {
 			continue
 		}
 		meta := i.sim.entriesMeta[entry]
-		denominator := queryTokens
-		if int(meta.tokenCount) > denominator {
-			denominator = int(meta.tokenCount)
-		}
+		denominator := max(int(meta.tokenCount), queryTokens)
 		overlap := float64(shared) / float64(denominator)
 		details, ok := similarityDetails(normalized, queryRunes, match.NormalizedValue, int(meta.runeCount), overlap)
 		if ok {
-			match.Reason = details.Reason
-			match.Score = details.Score
-			match.Why = details.Why
+			match.Detail = details
 			matches = append(matches, match)
 		}
 	}
@@ -590,19 +595,13 @@ func similarityStatsRunes(value string) (int, int) {
 	return runeCount, count
 }
 
-type similarityDetailsResult struct {
-	Reason string
-	Score  float64
-	Why    string
-}
-
 // similarityDetails reports how similar query a is to candidate b. Both sides
 // are already known to be similarity candidates, rune counts are precomputed,
 // and the word overlap ratio was already derived from posting counts. The
 // expensive Levenshtein distance only runs when the cheap word-overlap and
 // length-ratio bounds show its threshold is still reachable: the edit
 // similarity can never exceed shorterLen/longerLen.
-func similarityDetails(a string, aRunes int, b string, bRunes int, wordOverlap float64) (similarityDetailsResult, bool) {
+func similarityDetails(a string, aRunes int, b string, bRunes int, wordOverlap float64) (Detail, bool) {
 	shorter, longer := a, b
 	shorterLen, longerLen := aRunes, bRunes
 	bIsLonger := true
@@ -613,14 +612,14 @@ func similarityDetails(a string, aRunes int, b string, bRunes int, wordOverlap f
 	}
 	lengthRatio := float64(shorterLen) / float64(longerLen)
 	if lengthRatio >= 0.65 && strings.Contains(longer, shorter) {
-		score := maxFloat(wordOverlap, lengthRatio)
+		score := max(wordOverlap, lengthRatio)
 		why := fmt.Sprintf("%d%% word overlap", percent(wordOverlap))
 		if bIsLonger {
 			why = "source string is contained in the current translation value; " + why
 		} else {
 			why = "current translation value is contained in the source string; " + why
 		}
-		return similarityDetailsResult{
+		return Detail{
 			Reason: "contained-substring",
 			Score:  score,
 			Why:    why,
@@ -629,7 +628,7 @@ func similarityDetails(a string, aRunes int, b string, bRunes int, wordOverlap f
 	if wordOverlap >= 0.5 && lengthRatio >= 0.78 {
 		editSimilarity := levenshteinRatio(a, b)
 		if editSimilarity >= 0.78 {
-			return similarityDetailsResult{
+			return Detail{
 				Reason: "edit-similarity",
 				Score:  editSimilarity,
 				Why:    fmt.Sprintf("%d%% edit similarity with %d%% word overlap", percent(editSimilarity), percent(wordOverlap)),
@@ -637,13 +636,13 @@ func similarityDetails(a string, aRunes int, b string, bRunes int, wordOverlap f
 		}
 	}
 	if wordOverlap >= 0.7 {
-		return similarityDetailsResult{
+		return Detail{
 			Reason: "word-overlap",
 			Score:  wordOverlap,
 			Why:    fmt.Sprintf("%d%% word overlap", percent(wordOverlap)),
 		}, true
 	}
-	return similarityDetailsResult{}, false
+	return Detail{}, false
 }
 
 func wordSet(value string) map[string]bool {
@@ -670,10 +669,7 @@ func wordSet(value string) map[string]bool {
 func levenshteinRatio(a string, b string) float64 {
 	aRunes := []rune(a)
 	bRunes := []rune(b)
-	maxLen := len(aRunes)
-	if len(bRunes) > maxLen {
-		maxLen = len(bRunes)
-	}
+	maxLen := max(len(bRunes), len(aRunes))
 	if maxLen == 0 {
 		return 1
 	}
@@ -701,7 +697,7 @@ func levenshteinDistance(a []rune, b []rune) int {
 			if a[i-1] != b[j-1] {
 				cost = 1
 			}
-			current[j] = minInt(
+			current[j] = min(
 				previous[j]+1,
 				current[j-1]+1,
 				previous[j-1]+cost,
@@ -713,25 +709,8 @@ func levenshteinDistance(a []rune, b []rune) int {
 	return previous[len(b)]
 }
 
-func minInt(values ...int) int {
-	minimum := values[0]
-	for _, value := range values[1:] {
-		if value < minimum {
-			minimum = value
-		}
-	}
-	return minimum
-}
-
 func percent(score float64) int {
 	return int(score*100 + 0.5)
-}
-
-func maxFloat(a float64, b float64) float64 {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func (i *Index) Len() int {
