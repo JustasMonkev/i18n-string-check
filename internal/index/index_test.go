@@ -142,7 +142,7 @@ func TestNestedObjectsFlattenToDotKeys(t *testing.T) {
 func TestCountUniqueHandlesManyUnknownTokens(t *testing.T) {
 	const tokenCount = 10000
 	tokens := make([]string, 0, tokenCount+2)
-	for i := 0; i < tokenCount; i++ {
+	for i := range tokenCount {
 		tokens = append(tokens, "unknown"+strconv.Itoa(i))
 	}
 	tokens = append(tokens, tokens[0], tokens[tokenCount-1])
