@@ -16,7 +16,7 @@ lint: fmt
 	zig build -Doptimize=Debug
 
 fmt:
-	zig fmt --check build.zig src tools
+	zig fmt --check build.zig src
 
 run-example:
 	@zig build -Doptimize=ReleaseFast
