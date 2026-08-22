@@ -187,6 +187,133 @@ test "match matches filepath.Match" {
     try testing.expect(!gopath.match("[abc", "a"));
 }
 
+// The Windows convention is exercised from this POSIX test run because volume
+// handling is the part most easily got wrong and hardest to notice. The vectors
+// are Go's own, from path/filepath's wincleantests, winreltests and
+// winjointests.
+test "clean matches filepath.Clean under the Windows convention" {
+    const cases = [_]struct { in: []const u8, want: []const u8 }{
+        .{ .in = "c:", .want = "c:." },
+        .{ .in = "c:\\", .want = "c:\\" },
+        .{ .in = "c:\\abc", .want = "c:\\abc" },
+        .{ .in = "c:abc\\..\\..\\.\\.\\..\\def", .want = "c:..\\..\\def" },
+        .{ .in = "c:\\abc\\def\\..\\..", .want = "c:\\" },
+        .{ .in = "c:\\..\\abc", .want = "c:\\abc" },
+        .{ .in = "c:..\\abc", .want = "c:..\\abc" },
+        .{ .in = "c:\\b:\\..\\..\\..\\d", .want = "c:\\d" },
+        .{ .in = "\\", .want = "\\" },
+        .{ .in = "/", .want = "\\" },
+        .{ .in = "\\\\i\\..\\c$", .want = "\\\\i\\..\\c$" },
+        .{ .in = "\\\\i\\..\\i\\c$", .want = "\\\\i\\..\\i\\c$" },
+        .{ .in = "\\\\host\\share\\foo\\..\\bar", .want = "\\\\host\\share\\bar" },
+        .{ .in = "//host/share/foo/../baz", .want = "\\\\host\\share\\baz" },
+        .{ .in = "\\\\host\\share\\foo\\..\\..\\..\\..\\bar", .want = "\\\\host\\share\\bar" },
+        .{ .in = "\\\\.\\C:\\a\\..\\..\\..\\..\\bar", .want = "\\\\.\\C:\\bar" },
+        .{ .in = "\\\\.\\C:\\\\\\\\a", .want = "\\\\.\\C:\\a" },
+        .{ .in = "\\\\a\\b\\..\\c", .want = "\\\\a\\b\\c" },
+        .{ .in = "\\\\a\\b", .want = "\\\\a\\b" },
+        .{ .in = ".\\c:", .want = ".\\c:" },
+        .{ .in = ".\\c:\\foo", .want = ".\\c:\\foo" },
+        .{ .in = "//abc", .want = "\\\\abc" },
+        .{ .in = "///abc", .want = "\\\\\\abc" },
+        .{ .in = "//abc//", .want = "\\\\abc\\\\" },
+        .{ .in = "\\\\?\\C:\\", .want = "\\\\?\\C:\\" },
+        .{ .in = "\\\\?\\C:\\a", .want = "\\\\?\\C:\\a" },
+        // Cleaning must not move a colon element to the front of the path.
+        .{ .in = "a/../c:", .want = ".\\c:" },
+        .{ .in = "a\\..\\c:", .want = ".\\c:" },
+        .{ .in = "a/../c:/a", .want = ".\\c:\\a" },
+        .{ .in = "a/../../c:", .want = "..\\c:" },
+        .{ .in = "foo:bar", .want = "foo:bar" },
+        // Nor create a root local device path.
+        .{ .in = "/a/../??/a", .want = "\\.\\??\\a" },
+    };
+    for (cases) |c| {
+        const got = try gopath.cleanIn(testing.allocator, .windows, c.in);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c.want, got) catch |err| {
+            std.debug.print("cleanIn(.windows, \"{s}\")\n", .{c.in});
+            return err;
+        };
+    }
+}
+
+test "rel matches filepath.Rel under the Windows convention" {
+    const cases = [_]struct { base: []const u8, targ: []const u8, want: ?[]const u8 }{
+        .{ .base = "C:a\\b\\c", .targ = "C:a/b/d", .want = "..\\d" },
+        .{ .base = "C:\\", .targ = "D:\\", .want = null },
+        .{ .base = "C:", .targ = "D:", .want = null },
+        .{ .base = "C:\\Projects", .targ = "c:\\projects\\src", .want = "src" },
+        .{ .base = "C:\\Projects", .targ = "c:\\projects", .want = "." },
+        .{ .base = "C:\\Projects\\a\\..", .targ = "c:\\projects", .want = "." },
+        .{ .base = "\\\\host\\share", .targ = "\\\\host\\share\\file.txt", .want = "file.txt" },
+    };
+    for (cases) |c| {
+        if (c.want) |want| {
+            const got = try gopath.relIn(testing.allocator, .windows, c.base, c.targ);
+            defer testing.allocator.free(got);
+            testing.expectEqualStrings(want, got) catch |err| {
+                std.debug.print("relIn(.windows, \"{s}\", \"{s}\")\n", .{ c.base, c.targ });
+                return err;
+            };
+        } else {
+            try testing.expectError(
+                error.CannotRelate,
+                gopath.relIn(testing.allocator, .windows, c.base, c.targ),
+            );
+        }
+    }
+}
+
+test "join matches filepath.Join under the Windows convention" {
+    const cases = [_]struct { elems: []const []const u8, want: []const u8 }{
+        .{ .elems = &.{ "directory", "file" }, .want = "directory\\file" },
+        .{ .elems = &.{ "C:\\Windows\\", "System32" }, .want = "C:\\Windows\\System32" },
+        .{ .elems = &.{ "C:\\Windows\\", "" }, .want = "C:\\Windows" },
+        .{ .elems = &.{ "C:\\", "Windows" }, .want = "C:\\Windows" },
+        .{ .elems = &.{ "C:", "a" }, .want = "C:a" },
+        .{ .elems = &.{ "C:", "a\\b" }, .want = "C:a\\b" },
+        .{ .elems = &.{ "C:", "a", "b" }, .want = "C:a\\b" },
+        .{ .elems = &.{ "C:", "", "b" }, .want = "C:b" },
+        .{ .elems = &.{ "C:", "" }, .want = "C:." },
+        .{ .elems = &.{ "C:", "\\a" }, .want = "C:\\a" },
+        .{ .elems = &.{ "C:a", "b" }, .want = "C:a\\b" },
+        .{ .elems = &.{ "\\\\host\\share", "foo" }, .want = "\\\\host\\share\\foo" },
+        .{ .elems = &.{"\\\\host\\share\\foo"}, .want = "\\\\host\\share\\foo" },
+        .{ .elems = &.{ "//host/share", "foo/bar" }, .want = "\\\\host\\share\\foo\\bar" },
+        .{ .elems = &.{"\\"}, .want = "\\" },
+        .{ .elems = &.{ "\\", "a" }, .want = "\\a" },
+        .{ .elems = &.{ "\\\\", "a" }, .want = "\\\\a" },
+        .{ .elems = &.{ "\\", "a", "b" }, .want = "\\a\\b" },
+        .{ .elems = &.{ "\\\\a", "b", "c" }, .want = "\\\\a\\b\\c" },
+        .{ .elems = &.{ "a:\\b\\c", "x\\..\\y:\\..\\..\\z" }, .want = "a:\\b\\z" },
+        .{ .elems = &.{ "\\", "??\\a" }, .want = "\\.\\??\\a" },
+    };
+    for (cases) |c| {
+        const got = try gopath.joinIn(testing.allocator, .windows, c.elems);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c.want, got) catch |err| {
+            std.debug.print("joinIn(.windows, {s})\n", .{c.elems[0]});
+            return err;
+        };
+    }
+}
+
+test "volumeNameLen matches filepath.VolumeName" {
+    const cases = [_]struct { in: []const u8, want: usize }{
+        .{ .in = "c:\\foo", .want = 2 },
+        .{ .in = "\\\\host\\share\\a", .want = 12 },
+        .{ .in = "\\\\?\\C:\\a", .want = 6 },
+        .{ .in = "relative\\path", .want = 0 },
+        .{ .in = "", .want = 0 },
+    };
+    for (cases) |c| {
+        try testing.expectEqual(c.want, gopath.volumeNameLen(.windows, c.in));
+        // POSIX has no volumes at all.
+        try testing.expectEqual(@as(usize, 0), gopath.volumeNameLen(.posix, c.in));
+    }
+}
+
 test "ext matches filepath.Ext" {
     try testing.expectEqualStrings(".ts", gopath.ext("a/b.ts"));
     try testing.expectEqualStrings(".tsx", gopath.ext("a.b.tsx"));
@@ -794,6 +921,7 @@ test "discoverFiles filters extensions and excludes" {
     defer arena.deinit();
     const a = arena.allocator();
 
+    var failure: scan.Failure = .{};
     var tree = try tempTree(a, io, "discover");
     defer tree.deinit();
     try tree.write("src/a.ts", "");
@@ -804,7 +932,7 @@ test "discoverFiles filters extensions and excludes" {
     const files = try scan.discoverFiles(a, io, tree.path, .{
         .extensions = &.{"ts"},
         .exclude = &.{"custom"},
-    });
+    }, &failure);
     try testing.expectEqual(@as(usize, 1), files.len);
     try testing.expectEqualStrings("a.ts", gopath.base(files[0]));
 }
@@ -818,6 +946,7 @@ test "discoverFiles skips symlinked files" {
     defer arena.deinit();
     const a = arena.allocator();
 
+    var failure: scan.Failure = .{};
     var tree = try tempTree(a, io, "symlink");
     defer tree.deinit();
     try tree.write("src/a.ts", "");
@@ -828,7 +957,7 @@ test "discoverFiles skips symlinked files" {
     };
 
     const root = try std.fmt.allocPrint(a, "{s}/src", .{tree.path});
-    const files = try scan.discoverFiles(a, io, root, .{});
+    const files = try scan.discoverFiles(a, io, root, .{}, &failure);
     try testing.expectEqual(@as(usize, 1), files.len);
     try testing.expectEqualStrings("a.ts", gopath.base(files[0]));
 }
@@ -842,15 +971,41 @@ test "discoverFiles sorts results" {
     defer arena.deinit();
     const a = arena.allocator();
 
+    var failure: scan.Failure = .{};
     var tree = try tempTree(a, io, "sorted");
     defer tree.deinit();
     for ([_][]const u8{ "z.ts", "a.ts", "m/b.ts", "m/a.ts" }) |name| try tree.write(name, "");
 
-    const files = try scan.discoverFiles(a, io, tree.path, .{});
+    const files = try scan.discoverFiles(a, io, tree.path, .{}, &failure);
     try testing.expectEqual(@as(usize, 4), files.len);
     for (files[1..], files[0 .. files.len - 1]) |next, previous| {
         try testing.expect(std.mem.order(u8, previous, next) == .lt);
     }
+}
+
+test "discoverFiles reports an unreadable subdirectory instead of skipping it" {
+    // Root bypasses the permission bits, so this can only run unprivileged.
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var failure: scan.Failure = .{};
+    var tree = try tempTree(a, io, "unreadable");
+    defer tree.deinit();
+    try tree.write("src/a.ts", "");
+    try tree.write("src/locked/b.ts", "");
+    try tree.dir.setFilePermissions(io, "src/locked", @enumFromInt(0), .{});
+    defer tree.dir.setFilePermissions(io, "src/locked", @enumFromInt(0o755), .{}) catch {};
+
+    // Silently skipping the subtree would report a clean scan of a tree that
+    // was never fully read.
+    try testing.expectError(error.AccessDenied, scan.discoverFiles(a, io, tree.path, .{}, &failure));
 }
 
 // -- report ------------------------------------------------------------------

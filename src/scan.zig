@@ -19,6 +19,14 @@ pub const Options = struct {
     exclude: []const []const u8 = &.{},
 };
 
+/// Where a walk failed, so the message can name the path Go's would have.
+pub const Failure = struct {
+    /// The syscall Go's error would name.
+    op: []const u8 = "lstat",
+    /// Owned by the allocator passed to discoverFiles.
+    path: []const u8 = "",
+};
+
 const default_extensions = [_][]const u8{ "ts", "tsx", "js", "jsx" };
 
 pub fn discoverFiles(
@@ -26,6 +34,7 @@ pub fn discoverFiles(
     io: std.Io,
     root: []const u8,
     opts: Options,
+    failure: *Failure,
 ) ![][]const u8 {
     var extensions: std.StringHashMapUnmanaged(void) = .empty;
     defer extensions.deinit(allocator);
@@ -43,6 +52,7 @@ pub fn discoverFiles(
         .allocator = allocator,
         .io = io,
         .root = root,
+        .failure = failure,
         .extensions = &extensions,
         .excludes = excludes.items,
         .files = &files,
@@ -100,6 +110,7 @@ const Walker = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     root: []const u8,
+    failure: *Failure,
     extensions: *const std.StringHashMapUnmanaged(void),
     excludes: []const ExcludePattern,
     files: *std.ArrayList([]const u8),
@@ -107,6 +118,7 @@ const Walker = struct {
     fn walk(self: *Walker) !void {
         // A missing root is an error, as it is for Go's WalkDir; a root that is
         // a regular file simply yields nothing, also as it does there.
+        self.failure.* = .{ .op = "lstat", .path = self.root };
         const dir = std.Io.Dir.cwd().openDir(self.io, self.root, .{ .iterate = true }) catch |err| switch (err) {
             error.NotDir => {
                 try std.Io.Dir.cwd().access(self.io, self.root, .{});
@@ -127,6 +139,7 @@ const Walker = struct {
             for (names.items) |entry| self.allocator.free(entry.name);
             names.deinit(self.allocator);
         }
+        self.failure.* = .{ .op = "open", .path = dir_path };
         var it = dir.iterate();
         while (try it.next(self.io)) |entry| {
             try names.append(self.allocator, .{
@@ -146,17 +159,42 @@ const Walker = struct {
             if (std.mem.eql(u8, rel, ".")) continue;
 
             if (try self.matchesExclude(rel, entry.name)) continue;
+
+            // Some filesystems (NFS and several FUSE drivers) report entries
+            // without a kind. Go's ReadDir resolves those with an lstat before
+            // handing them over, so do the same rather than skipping them and
+            // silently reporting a clean scan.
+            const kind = if (entry.kind == .unknown)
+                (dir.statFile(self.io, entry.name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                    error.FileNotFound => continue, // vanished mid-walk
+                    else => {
+                        self.failure.* = .{ .op = "lstat", .path = path };
+                        keep_path = true; // the message outlives this iteration
+                        return err;
+                    },
+                }).kind
+            else
+                entry.kind;
+
             // Symlinks are never followed and never scanned, so a link cannot
             // pull a file from outside the tree into the report.
-            if (entry.kind == .sym_link) continue;
+            if (kind == .sym_link) continue;
 
-            if (entry.kind == .directory) {
-                const child = dir.openDir(self.io, entry.name, .{ .iterate = true }) catch continue;
+            if (kind == .directory) {
+                // An unreadable subdirectory is an error, not an empty one:
+                // silently skipping it would hide every file underneath and
+                // still exit 0. Go's WalkDir propagates the same failure.
+                const child = dir.openDir(self.io, entry.name, .{ .iterate = true }) catch |err| {
+                    self.failure.* = .{ .op = "open", .path = path };
+                    keep_path = true; // the message outlives this iteration
+                    return err;
+                };
                 defer child.close(self.io);
                 try self.walkDir(child, path);
+                self.failure.* = .{ .op = "open", .path = dir_path };
                 continue;
             }
-            if (entry.kind != .file) continue;
+            if (kind != .file) continue;
 
             var extension = gopath.ext(path);
             if (std.mem.startsWith(u8, extension, ".")) extension = extension[1..];

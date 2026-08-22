@@ -38,9 +38,48 @@ pub fn main(init: std.process.Init) !u8 {
         break :blk exit_usage_err;
     };
 
-    if (stdout.items.len > 0) try std.Io.File.stdout().writeStreamingAll(io, stdout.items);
-    if (stderr.items.len > 0) try std.Io.File.stderr().writeStreamingAll(io, stderr.items);
-    return status;
+    // A failed write is an I/O error like any other and takes the documented
+    // exit code, rather than unwinding out of main with whatever status the
+    // scan had already chosen.
+    var write_failed = false;
+    if (stdout.items.len > 0) {
+        writeStream(io, .out, stdout.items) catch |err| {
+            write_failed = true;
+            try fail(allocator, &stderr, "write /dev/stdout: {s}", .{errorText(err)});
+        };
+    }
+    if (stderr.items.len > 0) {
+        writeStream(io, .err, stderr.items) catch {
+            write_failed = true;
+        };
+    }
+    return if (write_failed) exit_usage_err else status;
+}
+
+const Stream = enum { out, err };
+
+/// Writes one of the standard streams, dying on a closed pipe the way Go does.
+///
+/// Go leaves SIGPIPE at its default disposition for the standard streams, so
+/// `check | head` kills the process silently instead of reporting an error. Any
+/// other failure is returned so the caller can take the I/O exit code.
+fn writeStream(io: std.Io, stream: Stream, bytes: []const u8) !void {
+    const file = switch (stream) {
+        .out => std.Io.File.stdout(),
+        .err => std.Io.File.stderr(),
+    };
+    file.writeStreamingAll(io, bytes) catch |err| switch (err) {
+        error.BrokenPipe => {
+            std.posix.sigaction(.PIPE, &.{
+                .handler = .{ .handler = std.posix.SIG.DFL },
+                .mask = std.posix.sigemptyset(),
+                .flags = 0,
+            }, null);
+            std.posix.raise(.PIPE) catch {};
+            std.process.exit(128 + @intFromEnum(std.posix.SIG.PIPE));
+        },
+        else => return err,
+    };
 }
 
 fn run(
@@ -60,7 +99,7 @@ fn run(
         try fail(allocator, stderr, "open {s}: {s}", .{ cfg.en_json, errorText(err) });
         return exit_usage_err;
     };
-    var idx = i18nindex.fromBytes(allocator, content, cfg.min_length) catch |err| switch (err) {
+    var idx = i18nindex.fromBytes(allocator, content, cfg.minLength()) catch |err| switch (err) {
         error.MalformedTranslations => {
             const detail = try jsonutil.describeError(allocator, content);
             try fail(allocator, stderr, "malformed en.json: {s}", .{detail});
@@ -70,11 +109,16 @@ fn run(
     };
     defer idx.deinit();
 
+    var walk_failure: scan.Failure = .{};
     const files = scan.discoverFiles(allocator, io, cfg.source_dir, .{
         .extensions = cfg.exts,
         .exclude = cfg.excludes,
-    }) catch |err| {
-        try fail(allocator, stderr, "lstat {s}: {s}", .{ cfg.source_dir, errorText(err) });
+    }, &walk_failure) catch |err| {
+        try fail(allocator, stderr, "{s} {s}: {s}", .{
+            walk_failure.op,
+            if (walk_failure.path.len > 0) walk_failure.path else cfg.source_dir,
+            errorText(err),
+        });
         return exit_usage_err;
     };
 
@@ -127,9 +171,13 @@ fn fail(
 fn errorText(err: anyerror) []const u8 {
     return switch (err) {
         error.FileNotFound => "no such file or directory",
-        error.AccessDenied => "permission denied",
+        error.AccessDenied, error.PermissionDenied => "permission denied",
         error.IsDir => "is a directory",
         error.NotDir => "not a directory",
+        error.NoSpaceLeft, error.DiskQuota => "no space left on device",
+        error.DeviceBusy => "device or resource busy",
+        error.SymLinkLoop => "too many levels of symbolic links",
+        error.NameTooLong => "file name too long",
         else => @errorName(err),
     };
 }
@@ -140,7 +188,9 @@ const Config = struct {
     en_json: []const u8 = "",
     source_dir: []const u8 = "",
     config_path: []const u8 = "",
-    min_length: usize = 8,
+    /// Signed while parsing so that a negative value from a config file reaches
+    /// the validation that rejects it, instead of being clamped to zero.
+    min_length: i64 = 8,
     exts: []const []const u8 = &.{},
     excludes: []const []const u8 = &.{},
     json: bool = false,
@@ -149,6 +199,11 @@ const Config = struct {
     baseline: []const u8 = "",
     /// Why the config file failed to parse, when it did.
     config_error: []const u8 = "",
+
+    /// Valid only after parseArgs has checked that min_length is not negative.
+    fn minLength(self: Config) usize {
+        return @intCast(self.min_length);
+    }
 };
 
 const default_exts = [_][]const u8{ "ts", "tsx", "js", "jsx" };
@@ -176,7 +231,7 @@ fn parseArgs(
     var excludes: std.ArrayList([]const u8) = .empty;
     try excludes.appendSlice(allocator, cfg.excludes);
     var exts_csv: []const u8 = try std.mem.join(allocator, ",", cfg.exts);
-    var min_length_signed: i64 = @intCast(cfg.min_length);
+    var min_length_signed: i64 = cfg.min_length;
 
     var positional: std.ArrayList([]const u8) = .empty;
     var it = FlagIterator{ .args = try reorderArgs(allocator, args) };
@@ -223,7 +278,7 @@ fn parseArgs(
         return error.Reported;
     }
 
-    cfg.min_length = @intCast(min_length_signed);
+    cfg.min_length = min_length_signed;
     cfg.en_json = positional.items[0];
     cfg.source_dir = positional.items[1];
     cfg.exts = try splitCSV(allocator, exts_csv);
@@ -415,7 +470,7 @@ fn loadConfigDefaults(
     };
 
     if (field(object, "minLength")) |value| switch (value) {
-        .integer => |n| cfg.min_length = if (n < 0) 0 else @intCast(n),
+        .integer => |n| cfg.min_length = n,
         else => return error.MalformedConfig,
     };
     if (field(object, "ext")) |value| cfg.exts = try stringArray(allocator, value);
@@ -646,8 +701,18 @@ fn scanAndMatch(
         workerMain(&ctx, &languages, &workers[0]);
     } else {
         const threads = try allocator.alloc(std.Thread, worker_count);
+        var started: usize = 0;
         for (threads, workers) |*thread, *worker| {
-            thread.* = try std.Thread.spawn(.{}, workerMain, .{ &ctx, &languages, worker });
+            thread.* = std.Thread.spawn(.{}, workerMain, .{ &ctx, &languages, worker }) catch |err| {
+                // Workers already running hold pointers to `ctx`, `languages`
+                // and their own `Worker`, all owned by this frame, so they have
+                // to finish before it unwinds. Exhausting the job queue stops
+                // them at the next file rather than after the whole scan.
+                ctx.next.store(files.len, .monotonic);
+                for (threads[0..started]) |running| running.join();
+                return err;
+            };
+            started += 1;
         }
         for (threads) |thread| thread.join();
     }
@@ -691,7 +756,7 @@ fn scanOne(
     // The pre-scan checks a cheap lexical superset of the file's literals
     // against the index. Files without a single matching candidate — the common
     // case — provably have no findings and skip parsing entirely.
-    if (!try fastscan.hasCandidateMatch(transient, path, content, ctx.cfg.min_length, worth)) return;
+    if (!try fastscan.hasCandidateMatch(transient, path, content, ctx.cfg.minLength(), worth)) return;
 
     const allocator = worker.persistent();
     const literals = extract.bytes(
@@ -701,7 +766,7 @@ fn scanOne(
         &worker.session,
         path,
         content,
-        ctx.cfg.min_length,
+        ctx.cfg.minLength(),
         worth,
     ) catch |err| switch (err) {
         error.ParseError => {
@@ -754,18 +819,19 @@ fn applyBaseline(
     };
     defer parsed.deinit();
 
+    // Go decoded the baseline into typed structs, so a file that is valid JSON
+    // but the wrong shape was rejected. Silently treating it as empty would
+    // re-enable every suppressed finding and flip a CI result on a typo.
+    const summary = validateBaseline(parsed.value) catch {
+        error_detail.* = "unexpected baseline structure";
+        return error.MalformedBaseline;
+    };
+
     var ignored: std.StringHashMapUnmanaged(void) = .empty;
     defer ignored.deinit(allocator);
-    if (parsed.value == .object) {
-        if (parsed.value.object.get("findings")) |value| {
-            if (value == .array) {
-                for (value.array.items) |item| {
-                    if (item != .object) continue;
-                    const signature = try baselineSignature(allocator, item.object);
-                    try ignored.put(allocator, signature, {});
-                }
-            }
-        }
+    for (summary) |item| {
+        const signature = try baselineSignature(allocator, item);
+        try ignored.put(allocator, signature, {});
     }
 
     const items = findings orelse return null;
@@ -780,6 +846,70 @@ fn applyBaseline(
     // Go slices the original in place, so an all-suppressed run still yields an
     // empty — not nil — slice, which serializes as `[]` rather than `null`.
     return filtered.items;
+}
+
+/// Checks the baseline against the shape Go's `report.Summary` decode accepted,
+/// returning its findings. A JSON null stands in for an absent value throughout,
+/// exactly as encoding/json treats it.
+fn validateBaseline(value: std.json.Value) ![]const std.json.ObjectMap {
+    const root = switch (value) {
+        .object => |object| object,
+        .null => return &.{},
+        else => return error.MalformedBaseline,
+    };
+    try expectField(root, "found", .bool);
+    try expectField(root, "count", .integer);
+    try expectField(root, "files", .integer);
+
+    const findings = root.get("findings") orelse return &.{};
+    const list = switch (findings) {
+        .array => |array| array,
+        .null => return &.{},
+        else => return error.MalformedBaseline,
+    };
+
+    var objects: std.ArrayList(std.json.ObjectMap) = .empty;
+    errdefer objects.deinit(std.heap.c_allocator);
+    for (list.items) |item| {
+        const finding = switch (item) {
+            .object => |object| object,
+            else => return error.MalformedBaseline,
+        };
+        for ([_][]const u8{ "file", "type", "literal", "normalizedLiteral" }) |name| {
+            try expectField(finding, name, .string);
+        }
+        for ([_][]const u8{ "line", "column" }) |name| {
+            try expectField(finding, name, .integer);
+        }
+        if (finding.get("matches")) |matches| {
+            switch (matches) {
+                .null => {},
+                .array => |array| for (array.items) |entry| {
+                    const match = switch (entry) {
+                        .object => |object| object,
+                        else => return error.MalformedBaseline,
+                    };
+                    for ([_][]const u8{ "key", "value", "reason", "why" }) |name| {
+                        try expectField(match, name, .string);
+                    }
+                    if (match.get("score")) |score| switch (score) {
+                        .integer, .float, .null => {},
+                        else => return error.MalformedBaseline,
+                    };
+                },
+                else => return error.MalformedBaseline,
+            }
+        }
+        try objects.append(std.heap.c_allocator, finding);
+    }
+    return objects.items;
+}
+
+/// A field must be absent, JSON null, or of the expected kind.
+fn expectField(object: std.json.ObjectMap, name: []const u8, comptime tag: std.meta.Tag(std.json.Value)) !void {
+    const value = object.get(name) orelse return;
+    if (value == .null) return;
+    if (value != tag) return error.MalformedBaseline;
 }
 
 fn baselineSignature(allocator: std.mem.Allocator, object: std.json.ObjectMap) ![]u8 {
