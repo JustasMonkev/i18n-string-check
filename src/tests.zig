@@ -185,6 +185,12 @@ test "match matches filepath.Match" {
     try testing.expect(!gopath.match("[^abc]d", "bd"));
     // A malformed pattern is reported as no match, as the callers expect.
     try testing.expect(!gopath.match("[abc", "a"));
+    // The class is still parsed once the name is exhausted, so this must not
+    // read an uninitialised rune.
+    try testing.expect(!gopath.match("a[bc]", "a"));
+    try testing.expect(!gopath.match("a[b-d]", "a"));
+    try testing.expect(!gopath.match("a[^b]", "a"));
+    try testing.expect(gopath.match("a[bc]", "ab"));
 }
 
 // The Windows convention is exercised from this POSIX test run because volume
@@ -510,6 +516,23 @@ test "bare placeholders do not become patterns" {
 
     const normalized = try normalize.normalize(a, "anything at all");
     try testing.expectEqual(@as(usize, 0), (try idx.lookupPatternNormalized(a, a, normalized)).len);
+}
+
+test "a dotted key and an equivalent nested key keep one value" {
+    // Go's flat map held a single value per flattened key; keeping both would
+    // treat a replaced translation as still current.
+    var idx = try loadIndex(
+        \\{"login.button":"Sign in now","login":{"button":"Log in now"}}
+    , 8);
+    defer idx.deinit();
+
+    const kept = try normalize.normalize(testing.allocator, "Log in now");
+    defer testing.allocator.free(kept);
+    try testing.expectEqual(@as(usize, 1), idx.lookupNormalized(kept).len);
+
+    const replaced = try normalize.normalize(testing.allocator, "Sign in now");
+    defer testing.allocator.free(replaced);
+    try testing.expectEqual(@as(usize, 0), idx.lookupNormalized(replaced).len);
 }
 
 test "malformed translations are rejected" {
@@ -960,6 +983,33 @@ test "discoverFiles skips symlinked files" {
     const files = try scan.discoverFiles(a, io, root, .{}, &failure);
     try testing.expectEqual(@as(usize, 1), files.len);
     try testing.expectEqualStrings("a.ts", gopath.base(files[0]));
+}
+
+test "discoverFiles does not descend into a symlinked root" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var failure: scan.Failure = .{};
+    var tree = try tempTree(a, io, "symlinkroot");
+    defer tree.deinit();
+    try tree.write("real/a.ts", "");
+    tree.dir.symLink(io, "real", "link", .{}) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+
+    // WalkDir stops at a symlinked root, so nothing under it is scanned.
+    const linked = try std.fmt.allocPrint(a, "{s}/link", .{tree.path});
+    try testing.expectEqual(@as(usize, 0), (try scan.discoverFiles(a, io, linked, .{}, &failure)).len);
+
+    // The real directory still scans.
+    const real = try std.fmt.allocPrint(a, "{s}/real", .{tree.path});
+    try testing.expectEqual(@as(usize, 1), (try scan.discoverFiles(a, io, real, .{}, &failure)).len);
 }
 
 test "discoverFiles sorts results" {

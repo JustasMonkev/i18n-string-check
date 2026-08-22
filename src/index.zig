@@ -326,6 +326,10 @@ pub fn fromBytes(allocator: std.mem.Allocator, content: []const u8, min_length: 
             else => return error.MalformedTranslations,
         }
     }
+    // A dotted key and an equivalent nested key flatten to the same name, and
+    // Go's flat map kept only one value for it. Keep the last in document
+    // order, matching how a repeated key is resolved.
+    try dedupeByKey(allocator, &flat);
     // Go ranges over a map here, so its entry order — and therefore the order
     // of the keys reported for a value shared by several keys — varies between
     // runs. Sorting makes that output stable.
@@ -353,6 +357,23 @@ const Entry = struct {
         return std.mem.order(u8, a.key, b.key) == .lt;
     }
 };
+
+/// Keeps the last entry for each flattened key, preserving document order.
+fn dedupeByKey(allocator: std.mem.Allocator, flat: *std.ArrayList(Entry)) !void {
+    var last_index: std.StringHashMapUnmanaged(usize) = .empty;
+    defer last_index.deinit(allocator);
+    try last_index.ensureTotalCapacity(allocator, @intCast(flat.items.len));
+    for (flat.items, 0..) |entry, i| last_index.putAssumeCapacity(entry.key, i);
+    if (last_index.count() == flat.items.len) return;
+
+    var kept: usize = 0;
+    for (flat.items, 0..) |entry, i| {
+        if (last_index.get(entry.key).? != i) continue;
+        flat.items[kept] = entry;
+        kept += 1;
+    }
+    flat.shrinkRetainingCapacity(kept);
+}
 
 fn flattenTranslations(
     allocator: std.mem.Allocator,

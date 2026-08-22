@@ -528,7 +528,10 @@ fn matchChunk(comptime c: Convention, chunk_in: []const u8, s_in: []const u8) Ma
         if (!failed and s.len == 0) failed = true;
         switch (chunk[0]) {
             '[' => {
-                var r: u21 = undefined;
+                // Zero, not undefined: when the name is already exhausted the
+                // class is still parsed for syntax errors, and Go compares
+                // against the zero rune rather than reading uninitialised memory.
+                var r: u21 = 0;
                 if (!failed) {
                     const decoded = gostd.decodeRune(s);
                     r = decoded.value;

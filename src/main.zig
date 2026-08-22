@@ -204,6 +204,23 @@ const Config = struct {
     fn minLength(self: Config) usize {
         return @intCast(self.min_length);
     }
+
+    /// Records which config field had the wrong type, so the message says more
+    /// than "malformed config", as Go's typed decode error did.
+    fn badField(
+        self: *Config,
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        expected: []const u8,
+        found: std.json.Value,
+    ) error{ MalformedConfig, OutOfMemory } {
+        self.config_error = try std.fmt.allocPrint(
+            allocator,
+            "\"{s}\" must be {s}, found {s}",
+            .{ name, expected, jsonKindName(found) },
+        );
+        return error.MalformedConfig;
+    }
 };
 
 const default_exts = [_][]const u8{ "ts", "tsx", "js", "jsx" };
@@ -466,34 +483,63 @@ fn loadConfigDefaults(
     const object = switch (parsed.value) {
         .object => |obj| obj,
         .null => return,
-        else => return error.MalformedConfig,
+        else => {
+            cfg.config_error = try std.fmt.allocPrint(
+                allocator,
+                "must be a JSON object, found {s}",
+                .{jsonKindName(parsed.value)},
+            );
+            return error.MalformedConfig;
+        },
     };
 
     if (field(object, "minLength")) |value| switch (value) {
         .integer => |n| cfg.min_length = n,
-        else => return error.MalformedConfig,
+        else => return cfg.badField(allocator, "minLength", "an integer", value),
     };
-    if (field(object, "ext")) |value| cfg.exts = try stringArray(allocator, value);
-    if (field(object, "exclude")) |value| cfg.excludes = try stringArray(allocator, value);
+    if (field(object, "ext")) |value| {
+        cfg.exts = stringArray(allocator, value) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return cfg.badField(allocator, "ext", "an array of strings", value),
+        };
+    }
+    if (field(object, "exclude")) |value| {
+        cfg.excludes = stringArray(allocator, value) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return cfg.badField(allocator, "exclude", "an array of strings", value),
+        };
+    }
     if (field(object, "json")) |value| switch (value) {
         .bool => |b| cfg.json = b,
-        else => return error.MalformedConfig,
+        else => return cfg.badField(allocator, "json", "a boolean", value),
     };
     if (field(object, "mode")) |value| switch (value) {
-        .string => |s| if (s.len > 0) {
-            cfg.mode = try allocator.dupe(u8, s);
+        .string => |text| if (text.len > 0) {
+            cfg.mode = try allocator.dupe(u8, text);
         },
-        else => return error.MalformedConfig,
+        else => return cfg.badField(allocator, "mode", "a string", value),
     };
     if (field(object, "similarityFlow")) |value| switch (value) {
         .bool => |b| cfg.similarity_flow = b,
-        else => return error.MalformedConfig,
+        else => return cfg.badField(allocator, "similarityFlow", "a boolean", value),
     };
     if (field(object, "baseline")) |value| switch (value) {
-        .string => |s| if (s.len > 0) {
-            cfg.baseline = try allocator.dupe(u8, s);
+        .string => |text| if (text.len > 0) {
+            cfg.baseline = try allocator.dupe(u8, text);
         },
-        else => return error.MalformedConfig,
+        else => return cfg.badField(allocator, "baseline", "a string", value),
+    };
+}
+
+/// Names the JSON kind the way the error message should read.
+fn jsonKindName(value: std.json.Value) []const u8 {
+    return switch (value) {
+        .null => "null",
+        .bool => "a boolean",
+        .integer, .float, .number_string => "a number",
+        .string => "a string",
+        .array => "an array",
+        .object => "an object",
     };
 }
 

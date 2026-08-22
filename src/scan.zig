@@ -119,13 +119,15 @@ const Walker = struct {
         // A missing root is an error, as it is for Go's WalkDir; a root that is
         // a regular file simply yields nothing, also as it does there.
         self.failure.* = .{ .op = "lstat", .path = self.root };
-        const dir = std.Io.Dir.cwd().openDir(self.io, self.root, .{ .iterate = true }) catch |err| switch (err) {
-            error.NotDir => {
-                try std.Io.Dir.cwd().access(self.io, self.root, .{});
-                return;
-            },
-            else => return err,
-        };
+        // WalkDir stats the root without following it, then stops unless it is
+        // a directory. A symlinked root is therefore visited but never
+        // descended into, which also keeps this walk's rule that a link cannot
+        // pull files in from outside the tree.
+        const info = try std.Io.Dir.cwd().statFile(self.io, self.root, .{ .follow_symlinks = false });
+        if (info.kind != .directory) return;
+
+        self.failure.* = .{ .op = "open", .path = self.root };
+        const dir = try std.Io.Dir.cwd().openDir(self.io, self.root, .{ .iterate = true });
         defer dir.close(self.io);
         try self.walkDir(dir, self.root);
     }
