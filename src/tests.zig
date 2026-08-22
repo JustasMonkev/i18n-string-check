@@ -422,12 +422,13 @@ const Extracted = struct {
 fn extractSource(name: []const u8, source: []const u8, min_length: usize) !Extracted {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     errdefer arena.deinit();
-    var languages = try extract.Languages.init(testing.allocator);
+    var languages = try extract.Languages.initAll(testing.allocator);
     errdefer languages.deinit();
     var session = try extract.Session.init();
     errdefer session.deinit();
     const literals = try extract.bytes(
         arena.allocator(),
+        testing.allocator,
         &languages,
         &session,
         name,
@@ -543,7 +544,7 @@ test "inline ignore marker suppresses the literal" {
 }
 
 test "parse errors are reported" {
-    var languages = try extract.Languages.init(testing.allocator);
+    var languages = try extract.Languages.initAll(testing.allocator);
     defer languages.deinit();
     var session = try extract.Session.init();
     defer session.deinit();
@@ -552,6 +553,7 @@ test "parse errors are reported" {
 
     try testing.expectError(error.ParseError, extract.bytes(
         arena.allocator(),
+        testing.allocator,
         &languages,
         &session,
         "bad.ts",

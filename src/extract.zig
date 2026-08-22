@@ -131,35 +131,64 @@ pub const LangSupport = struct {
     }
 };
 
-/// The three grammars, compiled once. Queries and languages are immutable, so
-/// this is shared by every worker; parsers and cursors are not, so each worker
-/// keeps its own.
+/// Which grammar parses a given file.
+pub const Kind = enum { typescript, tsx, javascript };
+
+pub fn kindForPath(path: []const u8) Kind {
+    const extension = gopath.ext(path);
+    if (eqlIgnoreCase(extension, ".ts")) return .typescript;
+    if (eqlIgnoreCase(extension, ".tsx") or eqlIgnoreCase(extension, ".jsx")) return .tsx;
+    return .javascript;
+}
+
+/// The compiled grammars, shared by every worker: queries and languages are
+/// immutable, while parsers and cursors are not, so each worker keeps its own.
+///
+/// Preparing one grammar compiles a query and walks its full symbol table, so
+/// only the grammars the scan will actually reach are built. A project of plain
+/// `.ts` files should not pay for the TSX and JavaScript grammars.
 pub const Languages = struct {
     allocator: std.mem.Allocator,
-    typescript: LangSupport,
-    tsx: LangSupport,
-    javascript: LangSupport,
+    typescript: ?LangSupport = null,
+    tsx: ?LangSupport = null,
+    javascript: ?LangSupport = null,
 
-    pub fn init(allocator: std.mem.Allocator) !Languages {
-        return .{
-            .allocator = allocator,
-            .typescript = try LangSupport.init(allocator, ts.tree_sitter_typescript()),
-            .tsx = try LangSupport.init(allocator, ts.tree_sitter_tsx()),
-            .javascript = try LangSupport.init(allocator, ts.tree_sitter_javascript()),
-        };
+    /// Prepares exactly the grammars `paths` needs.
+    pub fn init(allocator: std.mem.Allocator, paths: []const []const u8) !Languages {
+        var needed = [_]bool{false} ** @typeInfo(Kind).@"enum".fields.len;
+        for (paths) |path| needed[@intFromEnum(kindForPath(path))] = true;
+
+        var self = Languages{ .allocator = allocator };
+        errdefer self.deinit();
+        if (needed[@intFromEnum(Kind.typescript)]) {
+            self.typescript = try LangSupport.init(allocator, ts.tree_sitter_typescript());
+        }
+        if (needed[@intFromEnum(Kind.tsx)]) {
+            self.tsx = try LangSupport.init(allocator, ts.tree_sitter_tsx());
+        }
+        if (needed[@intFromEnum(Kind.javascript)]) {
+            self.javascript = try LangSupport.init(allocator, ts.tree_sitter_javascript());
+        }
+        return self;
+    }
+
+    /// Prepares every grammar, for callers that do not know the paths up front.
+    pub fn initAll(allocator: std.mem.Allocator) !Languages {
+        return init(allocator, &.{ "a.ts", "a.tsx", "a.js" });
     }
 
     pub fn deinit(self: *Languages) void {
-        self.typescript.deinit(self.allocator);
-        self.tsx.deinit(self.allocator);
-        self.javascript.deinit(self.allocator);
+        if (self.typescript) |*support| support.deinit(self.allocator);
+        if (self.tsx) |*support| support.deinit(self.allocator);
+        if (self.javascript) |*support| support.deinit(self.allocator);
     }
 
-    pub fn forPath(self: *const Languages, path: []const u8) *const LangSupport {
-        const extension = gopath.ext(path);
-        if (eqlIgnoreCase(extension, ".ts")) return &self.typescript;
-        if (eqlIgnoreCase(extension, ".tsx") or eqlIgnoreCase(extension, ".jsx")) return &self.tsx;
-        return &self.javascript;
+    fn forPath(self: *const Languages, path: []const u8) ?*const LangSupport {
+        return switch (kindForPath(path)) {
+            .typescript => if (self.typescript) |*support| support else null,
+            .tsx => if (self.tsx) |*support| support else null,
+            .javascript => if (self.javascript) |*support| support else null,
+        };
     }
 };
 
@@ -199,6 +228,7 @@ pub const ExtractError = anyerror;
 /// ancestor chain.
 pub fn bytes(
     allocator: std.mem.Allocator,
+    scratch: std.mem.Allocator,
     languages: *const Languages,
     session: *Session,
     path: []const u8,
@@ -206,7 +236,7 @@ pub fn bytes(
     min_length: usize,
     worth: ?MatchFunc,
 ) ExtractError![]Literal {
-    const support = languages.forPath(path);
+    const support = languages.forPath(path) orelse return error.LanguageNotPrepared;
     session.parser.setLanguage(support.language);
     const tree = try session.parser.parse(content);
     defer tree.deinit();
@@ -216,6 +246,7 @@ pub fn bytes(
 
     var walker = Walker{
         .allocator = allocator,
+        .scratch = scratch,
         .content = content,
         .min_length = min_length,
         .path = path,
@@ -248,7 +279,10 @@ pub fn bytes(
 }
 
 const Walker = struct {
+    /// Owns the strings kept in `literals`.
     allocator: std.mem.Allocator,
+    /// Holds the per-candidate work that is discarded again immediately.
+    scratch: std.mem.Allocator,
     content: []const u8,
     min_length: usize,
     path: []const u8,
@@ -259,27 +293,33 @@ const Walker = struct {
     ignore_lines: ?[]bool,
     literals: std.ArrayList(Literal) = .empty,
 
+    // Almost every literal in a file is rejected here, so the whole path runs on
+    // the scratch allocator and borrows rather than copies wherever it can. Only
+    // a literal that survives every check is copied into `allocator`.
     fn visit(self: *Walker, kind: LiteralKind, node: ts.Node) !void {
-        var value: []const u8 = undefined;
+        var raw = gostd.Text.borrow("");
+        defer raw.deinit(self.scratch);
         switch (kind) {
-            .string => value = (try decodeQuoted(self.allocator, node.content(self.content))) orelse return,
+            .string => raw = (try decodeQuoted(self.scratch, node.content(self.content))) orelse return,
             .template => {
                 if (self.hasSubstitution(node)) return;
-                value = (try decodeTemplate(self.allocator, node.content(self.content))) orelse return;
+                raw = (try decodeTemplate(self.scratch, node.content(self.content))) orelse return;
             },
-            .jsx_text => value = trimSpace(node.content(self.content)),
+            .jsx_text => raw = .borrow(trimSpace(node.content(self.content))),
         }
         // Collapse whitespace once and reuse it for the length check, the
         // stored literal and the normalized form.
-        const collapsed = try normalize.collapseWhitespace(self.allocator, value);
-        if (normalize.gateLength(collapsed) < self.min_length) return;
-        const normalized = try gostd.toLowerString(self.allocator, collapsed);
-        if (normalized.len == 0) return;
+        const collapsed = try normalize.collapse(self.scratch, raw.bytes);
+        defer collapsed.deinit(self.scratch);
+        if (normalize.gateLength(collapsed.bytes) < self.min_length) return;
+        const normalized = try gostd.toLowerText(self.scratch, collapsed.bytes);
+        defer normalized.deinit(self.scratch);
+        if (normalized.bytes.len == 0) return;
         // The worth filter runs before the context checks: matching against the
         // index is a hash lookup, while the context checks walk the ancestor
         // chain, so uninteresting literals never pay for that walk.
         if (self.worth) |filter| {
-            if (!try filter.worth(normalized)) return;
+            if (!try filter.worth(normalized.bytes)) return;
         }
         if (kind == .string and !self.shouldScanString(node)) return;
         const point = node.startPoint();
@@ -288,8 +328,8 @@ const Walker = struct {
             .file = self.path,
             .line = @as(usize, point.row) + 1,
             .column = @as(usize, point.column) + 1,
-            .literal = collapsed,
-            .normalized_literal = normalized,
+            .literal = try self.allocator.dupe(u8, collapsed.bytes),
+            .normalized_literal = try self.allocator.dupe(u8, normalized.bytes),
         });
     }
 
@@ -420,31 +460,35 @@ pub fn trimSpace(s: []const u8) []const u8 {
     return s[start..end];
 }
 
-fn decodeQuoted(allocator: std.mem.Allocator, raw: []const u8) !?[]const u8 {
+fn decodeQuoted(allocator: std.mem.Allocator, raw: []const u8) !?gostd.Text {
     if (raw.len < 2) return null;
     const quote = raw[0];
     if (quote != '\'' and quote != '"') return null;
     return try unquoteJS(allocator, raw[1 .. raw.len - 1], quote);
 }
 
-fn decodeTemplate(allocator: std.mem.Allocator, raw: []const u8) !?[]const u8 {
+fn decodeTemplate(allocator: std.mem.Allocator, raw: []const u8) !?gostd.Text {
     if (raw.len < 2 or raw[0] != '`' or raw[raw.len - 1] != '`') return null;
     return try unquoteJS(allocator, raw[1 .. raw.len - 1], '`');
 }
 
-/// Decodes JavaScript escape sequences. Anything Go's strconv would reject
-/// leaves the text untouched, which is what the original does.
-pub fn unquoteJS(allocator: std.mem.Allocator, value: []const u8, quote: u8) ![]const u8 {
-    if (std.mem.indexOfScalar(u8, value, '\\') == null) return value;
+/// Decodes JavaScript escape sequences, borrowing the input when it holds no
+/// escapes. Anything Go's strconv would reject leaves the text untouched, which
+/// is what the original does.
+pub fn unquoteJS(allocator: std.mem.Allocator, value: []const u8, quote: u8) !gostd.Text {
+    if (std.mem.indexOfScalar(u8, value, '\\') == null) return .borrow(value);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.ensureTotalCapacity(allocator, value.len);
     var rest = value;
     while (rest.len > 0) {
-        const decoded = gostd.unquoteChar(rest, quote) orelse return value;
+        const decoded = gostd.unquoteChar(rest, quote) orelse {
+            out.deinit(allocator);
+            return .borrow(value);
+        };
         var buf: [4]u8 = undefined;
         try out.appendSlice(allocator, gostd.encodeRune(&buf, decoded.value));
         rest = decoded.tail;
     }
-    return out.toOwnedSlice(allocator);
+    return .own(try out.toOwnedSlice(allocator));
 }

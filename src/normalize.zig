@@ -7,16 +7,16 @@ const gostd = @import("gostd.zig");
 // TODO: Replace with full Unicode case folding if/when supporting non-ASCII
 // locale matching.
 pub fn normalize(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
-    const collapsed = try collapseWhitespace(allocator, value);
-    defer allocator.free(collapsed);
-    return gostd.toLowerString(allocator, collapsed);
+    const collapsed = try collapse(allocator, value);
+    defer collapsed.deinit(allocator);
+    return gostd.toLowerString(allocator, collapsed.bytes);
 }
 
 /// Trims the string and collapses every whitespace run into a single space.
 /// Most inputs are already collapsed, so it first scans for a violation and
-/// returns a copy of the input when none is found.
-pub fn collapseWhitespace(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
-    if (value.len == 0) return allocator.alloc(u8, 0);
+/// borrows the input when none is found.
+pub fn collapse(allocator: std.mem.Allocator, value: []const u8) !gostd.Text {
+    if (value.len == 0) return .borrow(value);
 
     var previous_space = true; // catches a leading space
     var clean = true;
@@ -37,7 +37,7 @@ pub fn collapseWhitespace(allocator: std.mem.Allocator, value: []const u8) ![]u8
         previous_space = false;
     }
     // previous_space still set after the loop means a trailing space.
-    if (clean and !previous_space) return allocator.dupe(u8, value);
+    if (clean and !previous_space) return .borrow(value);
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -56,15 +56,22 @@ pub fn collapseWhitespace(allocator: std.mem.Allocator, value: []const u8) ![]u8
         var buf: [4]u8 = undefined;
         try out.appendSlice(allocator, gostd.encodeRune(&buf, item.value));
     }
-    return out.toOwnedSlice(allocator);
+    return .own(try out.toOwnedSlice(allocator));
+}
+
+/// collapse for callers that always want to own the result.
+pub fn collapseWhitespace(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    const text = try collapse(allocator, value);
+    if (text.owned) return @constCast(text.bytes);
+    return allocator.dupe(u8, text.bytes);
 }
 
 /// The length gate: collapsed byte length plus one extra per collapsed space,
 /// which counts space-separated phrases conservatively.
 pub fn trimmedLength(allocator: std.mem.Allocator, value: []const u8) !usize {
-    const trimmed = try collapseWhitespace(allocator, value);
-    defer allocator.free(trimmed);
-    return gateLength(trimmed);
+    const trimmed = try collapse(allocator, value);
+    defer trimmed.deinit(allocator);
+    return gateLength(trimmed.bytes);
 }
 
 /// gateLength of an already-collapsed string.

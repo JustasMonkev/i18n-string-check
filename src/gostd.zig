@@ -139,21 +139,60 @@ pub fn toLower(r: u21) u21 {
     return tables.toLowerNonASCII(r);
 }
 
-/// strings.ToLower. ASCII-only input takes the byte-wise path, and malformed
-/// UTF-8 becomes U+FFFD, both matching Go.
-pub fn toLowerString(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+/// A string that either borrows its input or owns a fresh allocation.
+///
+/// Go's `strings` functions hand the input straight back when nothing needs
+/// changing, which matters here because the extractor runs these over every
+/// literal in a file and discards almost all of them. Keeping the distinction
+/// explicit lets callers skip the copy on that path and still know what to free.
+pub const Text = struct {
+    bytes: []const u8,
+    owned: bool,
+
+    pub fn borrow(bytes: []const u8) Text {
+        return .{ .bytes = bytes, .owned = false };
+    }
+
+    pub fn own(bytes: []const u8) Text {
+        return .{ .bytes = bytes, .owned = true };
+    }
+
+    pub fn deinit(self: Text, allocator: std.mem.Allocator) void {
+        if (self.owned) allocator.free(self.bytes);
+    }
+};
+
+/// strings.ToLower, borrowing the input when no rune changes. Malformed UTF-8
+/// becomes U+FFFD, which counts as a change, both matching Go.
+pub fn toLowerText(allocator: std.mem.Allocator, s: []const u8) !Text {
+    // ASCII fast path: Go stops scanning at the first non-ASCII byte.
     var ascii = true;
+    var has_upper = false;
     for (s) |b| {
         if (b >= 0x80) {
             ascii = false;
             break;
         }
+        has_upper = has_upper or (b >= 'A' and b <= 'Z');
     }
     if (ascii) {
+        if (!has_upper) return .borrow(s);
         const out = try allocator.alloc(u8, s.len);
         for (s, 0..) |b, i| out[i] = if (b >= 'A' and b <= 'Z') b + ('a' - 'A') else b;
-        return out;
+        return .own(out);
     }
+
+    var changed = false;
+    var scan = runes(s);
+    while (scan.next()) |item| {
+        // An invalid byte is rewritten as U+FFFD, so it forces a rebuild.
+        if ((item.value == rune_error and item.size == 1) or toLower(item.value) != item.value) {
+            changed = true;
+            break;
+        }
+    }
+    if (!changed) return .borrow(s);
+
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.ensureTotalCapacity(allocator, s.len);
@@ -162,7 +201,14 @@ pub fn toLowerString(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
         var buf: [4]u8 = undefined;
         try out.appendSlice(allocator, encodeRune(&buf, toLower(item.value)));
     }
-    return out.toOwnedSlice(allocator);
+    return .own(try out.toOwnedSlice(allocator));
+}
+
+/// toLowerText for callers that always want to own the result.
+pub fn toLowerString(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    const text = try toLowerText(allocator, s);
+    if (text.owned) return @constCast(text.bytes);
+    return allocator.dupe(u8, text.bytes);
 }
 
 // -- strconv -----------------------------------------------------------------

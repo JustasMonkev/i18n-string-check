@@ -610,7 +610,7 @@ fn scanAndMatch(
 ) !?[]report.Finding {
     if (files.len == 0) return null;
 
-    var languages = try extract.Languages.init(allocator);
+    var languages = try extract.Languages.init(allocator, files);
     defer languages.deinit();
 
     var cache = MatchCache{
@@ -696,6 +696,7 @@ fn scanOne(
     const allocator = worker.persistent();
     const literals = extract.bytes(
         allocator,
+        transient,
         languages,
         &worker.session,
         path,

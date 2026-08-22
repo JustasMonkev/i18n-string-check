@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
     b.step("test", "Run the test suite").dependOn(&run_unit_tests.step);
 }
 
-const c_flags = [_][]const u8{
+const base_c_flags = [_][]const u8{
     "-std=c11",
     // Upstream tree-sitter and the generated grammars are warning-clean under
     // their own build, but not under Zig's stricter defaults; the vendored
@@ -79,6 +79,16 @@ const c_flags = [_][]const u8{
     "-fno-sanitize=function",
 };
 
+// Parsing is where a scan spends most of its time, and it happens entirely in
+// this C. -O3 plus frame-pointer omission measurably beats Zig's -O2 default on
+// the grammars' large table-driven parsers. Both are confined to the fastest
+// build so that debug and safe builds keep their readable C stack traces.
+const fast_c_flags = base_c_flags ++ [_][]const u8{"-O3"};
+
+fn cFlags(optimize: std.builtin.OptimizeMode) []const []const u8 {
+    return if (optimize == .ReleaseFast) &fast_c_flags else &base_c_flags;
+}
+
 fn treeSitterRuntime(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -86,6 +96,7 @@ fn treeSitterRuntime(
 ) *std.Build.Step.Compile {
     const mod = b.createModule(.{ .target = target, .optimize = optimize });
     mod.link_libc = true;
+    if (optimize == .ReleaseFast) mod.omit_frame_pointer = true;
     mod.addIncludePath(b.path("vendor/tree-sitter/include"));
     mod.addIncludePath(b.path("vendor/tree-sitter/src"));
     mod.addCSourceFiles(.{
@@ -106,7 +117,7 @@ fn treeSitterRuntime(
             "tree_cursor.c",
             "wasm_store.c",
         },
-        .flags = &c_flags,
+        .flags = cFlags(optimize),
     });
     return b.addLibrary(.{
         .name = "tree-sitter",
@@ -129,12 +140,13 @@ fn grammar(
 ) *std.Build.Step.Compile {
     const mod = b.createModule(.{ .target = target, .optimize = optimize });
     mod.link_libc = true;
+    if (optimize == .ReleaseFast) mod.omit_frame_pointer = true;
     // Generated grammars include "tree_sitter/parser.h" from their own tree.
     mod.addIncludePath(b.path(spec.root));
     mod.addCSourceFiles(.{
         .root = b.path(spec.root),
         .files = spec.files,
-        .flags = &c_flags,
+        .flags = cFlags(optimize),
     });
     return b.addLibrary(.{
         .name = spec.name,

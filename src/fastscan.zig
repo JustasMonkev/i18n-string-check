@@ -88,9 +88,8 @@ fn checkQuotedCandidate(
         return checkCandidateBytes(allocator, raw, min_length, worth);
     }
     const unquoted = try extract.unquoteJS(allocator, raw, quote);
-    // unquoteJS hands back the input untouched when nothing needed decoding.
-    defer if (unquoted.ptr != raw.ptr) allocator.free(unquoted);
-    return checkCandidate(allocator, unquoted, min_length, worth);
+    defer unquoted.deinit(allocator);
+    return checkCandidate(allocator, unquoted.bytes, min_length, worth);
 }
 
 fn hasUnescapedSubstitution(raw: []const u8) bool {
@@ -138,13 +137,13 @@ fn checkCandidate(
     min_length: usize,
     worth: extract.MatchFunc,
 ) !bool {
-    const collapsed = try normalize.collapseWhitespace(allocator, value);
-    defer allocator.free(collapsed);
-    if (normalize.gateLength(collapsed) < min_length) return false;
-    const normalized = try gostd.toLowerString(allocator, collapsed);
-    defer allocator.free(normalized);
-    if (normalized.len == 0) return false;
-    return worth.worth(normalized);
+    const collapsed = try normalize.collapse(allocator, value);
+    defer collapsed.deinit(allocator);
+    if (normalize.gateLength(collapsed.bytes) < min_length) return false;
+    const normalized = try gostd.toLowerText(allocator, collapsed.bytes);
+    defer normalized.deinit(allocator);
+    if (normalized.bytes.len == 0) return false;
+    return worth.worth(normalized.bytes);
 }
 
 // Byte classes for the fast candidate gate below.
