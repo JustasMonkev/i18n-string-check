@@ -1,8 +1,7 @@
-# Go build/test artifacts
-/i18n-string-check
-/i18n-lint
-*.test
-coverage.out
+# Zig build artifacts
+/zig-out/
+/.zig-cache/
+zig-cache/
 
 # npm/package artifacts
 /dist/

@@ -146,6 +146,28 @@ Project defaults can live in `.i18n-string-check.json`:
 }
 ```
 
+## Building From Source
+
+`i18n-string-check` is written in [Zig](https://ziglang.org) and needs Zig 0.16
+or newer. Nothing else: the tree-sitter runtime and the TypeScript, TSX and
+JavaScript grammars are vendored under `vendor/`, so the build is hermetic and
+needs no network access or system libraries.
+
+```sh
+zig build -Doptimize=ReleaseFast   # binary at zig-out/bin/i18n-string-check
+zig build test                     # run the test suite
+zig build run -- ./locales/en.json ./src
+```
+
+`make build`, `make test` and `make lint` wrap the same commands, and
+`npm run build` writes the binary to `dist/` for packaging.
+
+Zig cross-compiles, so a release binary for another platform is one flag away:
+
+```sh
+zig build -Doptimize=ReleaseFast -Dtarget=aarch64-macos
+```
+
 ## Fixture Project
 
 `testdata/` is a small Vite React project with Vitest unit tests, Playwright E2E tests, `package.json`, and `package-lock.json`. Its `devDependencies` include `i18n-string-check` through `file:..`, so its npm scripts resolve the CLI through `node_modules/.bin` like a real consuming project:
@@ -157,7 +179,7 @@ npm run i18n:string-check:source
 npm run i18n:string-check:tests
 ```
 
-The Go test suite builds source snippets and temporary projects inside tests, so normal `go test ./...` does not depend on installed JavaScript fixtures.
+The Zig test suite builds source snippets and temporary projects inside tests, so `zig build test` does not depend on installed JavaScript fixtures.
 
 `testdata/similarity-flow/` contains focused examples for likely stale hardcoded translation matching:
 

@@ -1,7 +1,7 @@
-.PHONY: build test lint run-example npm-build npm-pack
+.PHONY: build test lint fmt run-example npm-build npm-pack clean
 
 build:
-	go build ./cmd/i18n-string-check
+	zig build -Doptimize=ReleaseFast
 
 npm-build:
 	npm run build
@@ -10,11 +10,17 @@ npm-pack:
 	npm pack
 
 test:
-	go test ./...
+	zig build test
 
-lint:
-	go vet ./...
+lint: fmt
+	zig build -Doptimize=Debug
+
+fmt:
+	zig fmt --check build.zig src tools
 
 run-example:
-	@go build -o /tmp/i18n-string-check-example ./cmd/i18n-string-check
-	@/tmp/i18n-string-check-example ./testdata/locales/en.json ./testdata/src; status=$$?; test $$status -eq 1
+	@zig build -Doptimize=ReleaseFast
+	@./zig-out/bin/i18n-string-check ./testdata/locales/en.json ./testdata/src; status=$$?; test $$status -eq 1
+
+clean:
+	rm -rf zig-out .zig-cache dist

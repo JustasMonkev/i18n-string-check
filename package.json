@@ -14,8 +14,8 @@
     "README.md"
   ],
   "scripts": {
-    "build": "go build -o dist/i18n-string-check ./cmd/i18n-string-check",
-    "test": "go test ./...",
+    "build": "zig build -Doptimize=ReleaseFast --prefix dist --prefix-exe-dir .",
+    "test": "zig build test",
     "prepack": "npm run build"
   }
 }
