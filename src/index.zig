@@ -40,6 +40,10 @@ const SimIndex = struct {
 /// Reusable per-query state. `counts` is indexed by entry: 0 untouched, -1
 /// rejected by the length filter, otherwise the number of shared tokens so
 /// far. `touched` lists the entries to reset after the query.
+///
+/// One of these belongs to each worker, and its lists grow during lookups on
+/// that worker's thread, so `allocator` must be thread-safe — an arena shared
+/// between workers would be a data race in its own bookkeeping.
 pub const SimScratch = struct {
     allocator: std.mem.Allocator,
     counts: []i32 = &.{},

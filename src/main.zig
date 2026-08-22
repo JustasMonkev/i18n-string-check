@@ -70,6 +70,10 @@ fn writeStream(io: std.Io, stream: Stream, bytes: []const u8) !void {
     };
     file.writeStreamingAll(io, bytes) catch |err| switch (err) {
         error.BrokenPipe => {
+            if (builtin.os.tag == .windows) {
+                // Windows has no SIGPIPE; a broken pipe is just a failed write.
+                return err;
+            }
             std.posix.sigaction(.PIPE, &.{
                 .handler = .{ .handler = std.posix.SIG.DFL },
                 .mask = std.posix.sigemptyset(),
@@ -122,15 +126,12 @@ fn run(
         return exit_usage_err;
     };
 
-    var findings = scanAndMatch(allocator, io, files, cfg, idx) catch |err| switch (err) {
-        error.ParseError => {
-            // The failing worker recorded which file it was.
-            try fail(allocator, stderr, "{s}", .{
-                if (scan_error_detail.len > 0) scan_error_detail else "parse error",
-            });
-            return exit_usage_err;
-        },
-        else => return err,
+    var findings = scanAndMatch(allocator, io, files, cfg, idx) catch |err| {
+        // The failing worker recorded which file it was and why.
+        try fail(allocator, stderr, "{s}", .{
+            if (scan_error_detail.len > 0) scan_error_detail else errorText(err),
+        });
+        return exit_usage_err;
     };
     if (findings) |items| {
         for (items) |*finding| finding.file = try displayPath(allocator, io, finding.file);
@@ -493,8 +494,11 @@ fn loadConfigDefaults(
         },
     };
 
+    // A JSON null leaves the default in place: Go decoded these into pointers
+    // and plain strings, for which null simply means "absent".
     if (field(object, "minLength")) |value| switch (value) {
         .integer => |n| cfg.min_length = n,
+        .null => {},
         else => return cfg.badField(allocator, "minLength", "an integer", value),
     };
     if (field(object, "ext")) |value| {
@@ -511,22 +515,26 @@ fn loadConfigDefaults(
     }
     if (field(object, "json")) |value| switch (value) {
         .bool => |b| cfg.json = b,
+        .null => {},
         else => return cfg.badField(allocator, "json", "a boolean", value),
     };
     if (field(object, "mode")) |value| switch (value) {
         .string => |text| if (text.len > 0) {
             cfg.mode = try allocator.dupe(u8, text);
         },
+        .null => {},
         else => return cfg.badField(allocator, "mode", "a string", value),
     };
     if (field(object, "similarityFlow")) |value| switch (value) {
         .bool => |b| cfg.similarity_flow = b,
+        .null => {},
         else => return cfg.badField(allocator, "similarityFlow", "a boolean", value),
     };
     if (field(object, "baseline")) |value| switch (value) {
         .string => |text| if (text.len > 0) {
             cfg.baseline = try allocator.dupe(u8, text);
         },
+        .null => {},
         else => return cfg.badField(allocator, "baseline", "a string", value),
     };
 }
@@ -730,10 +738,16 @@ fn scanAndMatch(
         worker.* = .{
             .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
             .session = try extract.Session.init(),
-            .sim_scratch = try i18nindex.SimScratch.init(allocator, idx),
+            // Not the shared arena: this grows on the worker's own thread.
+            .sim_scratch = try i18nindex.SimScratch.init(transient, idx),
         };
     }
-    defer for (workers) |*worker| worker.session.deinit();
+    // The scratch buffers are worker-local and unused once the workers join;
+    // the worker arenas outlive this call because the findings point into them.
+    defer for (workers) |*worker| {
+        worker.session.deinit();
+        worker.sim_scratch.deinit();
+    };
 
     var ctx = ScanContext{
         .allocator = allocator,
@@ -793,7 +807,16 @@ fn scanOne(
     worker: *Worker,
     path: []const u8,
 ) !void {
-    const content = try std.Io.Dir.cwd().readFileAlloc(ctx.io, path, transient, .unlimited);
+    const content = std.Io.Dir.cwd().readFileAlloc(ctx.io, path, transient, .unlimited) catch |err| {
+        // Without this the top level could only print an error name, which says
+        // nothing about which of the scanned files went missing.
+        worker.err_detail = try std.fmt.allocPrint(
+            worker.persistent(),
+            "open {s}: {s}",
+            .{ path, errorText(err) },
+        );
+        return err;
+    };
     defer transient.free(content);
 
     var matcher = Matcher{ .cache = ctx.cache, .worker = worker };

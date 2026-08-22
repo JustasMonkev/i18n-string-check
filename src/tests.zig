@@ -368,7 +368,7 @@ test "hasExactValue" {
 }
 
 fn lookupSimilar(idx: *i18nindex.Index, arena: std.mem.Allocator, value: []const u8) ![]i18nindex.Match {
-    var scratch = try i18nindex.SimScratch.init(testing.allocator, idx);
+    var scratch = try i18nindex.SimScratch.init(std.heap.c_allocator, idx);
     defer scratch.deinit();
     const normalized = try normalize.normalize(arena, value);
     return idx.lookupSimilarNormalized(arena, testing.allocator, &scratch, normalized);
