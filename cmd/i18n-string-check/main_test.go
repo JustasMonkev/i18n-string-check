@@ -372,3 +372,45 @@ func TestRunTestModeAllowsExactMultilineValue(t *testing.T) {
 		t.Fatalf("exit code = %d, want 0; output:\n%s", code, output)
 	}
 }
+
+func TestRunPluralBranchesInSourceAndTestMode(t *testing.T) {
+	en := `{"cart":"{count, plural, =0 {Your cart is empty} one {One item in cart} other {# items in cart}}"}`
+	dir := fixtureProjectWithFiles(t, en, map[string]string{
+		"Cart.TSX": `export const Cart = () => <p>Your cart is empty</p>;`,
+		"cart.ts":  `const a = "One item in cart"; const b = "one item in cart";`,
+	})
+	code, output := runBinary(t, dir, filepath.Join(dir, "en.json"), filepath.Join(dir, "src"), "--json")
+	if code != 1 {
+		t.Fatalf("source mode exit code = %d, want 1; output:\n%s", code, output)
+	}
+	var summary struct{ Count int }
+	if err := json.Unmarshal([]byte(output), &summary); err != nil || summary.Count != 3 {
+		t.Fatalf("source mode count = %d (err %v), want 3 (Cart.TSX + both cart.ts literals); output:\n%s", summary.Count, err, output)
+	}
+	if !strings.Contains(output, `"variant": "Your cart is empty"`) {
+		t.Fatalf("JSON output missing variant:\n%s", output)
+	}
+
+	// Test mode accepts the exact branch text and flags only the case drift.
+	code, output = runBinary(t, dir, filepath.Join(dir, "en.json"), filepath.Join(dir, "src"), "--mode=test", "--json")
+	if err := json.Unmarshal([]byte(output), &summary); err != nil || code != 1 || summary.Count != 1 || !strings.Contains(output, `"literal": "one item in cart"`) {
+		t.Fatalf("test mode exit=%d count=%d, want 1 finding for the lowercase literal; output:\n%s", code, summary.Count, output)
+	}
+}
+
+func TestRunOutputIsDeterministic(t *testing.T) {
+	en := `{"a.b":"Flat dotted value here","a":{"b":"Nested object value here"},
+		"x.save":"Save changes","y.save":"Save changes","z.save":"Save changes"}`
+	dir := fixtureProjectWithEN(t, en, `["Flat dotted value here", "Nested object value here", "Save changes"]`)
+	_, first := runBinary(t, dir, filepath.Join(dir, "en.json"), filepath.Join(dir, "src"))
+	for _, want := range []string{`value: "Flat dotted value here"`, `value: "Nested object value here"`} {
+		if !strings.Contains(first, want) {
+			t.Fatalf("output missing %s:\n%s", want, first)
+		}
+	}
+	for range 10 {
+		if _, again := runBinary(t, dir, filepath.Join(dir, "en.json"), filepath.Join(dir, "src")); again != first {
+			t.Fatalf("output changed between runs:\n%s\n---\n%s", first, again)
+		}
+	}
+}

@@ -78,7 +78,8 @@ Flags:
     Default: 8
 
 --ext=ts,tsx,js,jsx
-    Comma-separated extensions to scan.
+    Comma-separated extensions to scan, matched case-insensitively.
+    .mts/.cts use the TypeScript grammar; .mjs/.cjs use JavaScript.
     Default: ts,tsx,js,jsx
 
 --exclude=pattern
@@ -211,7 +212,7 @@ Nested locale files are flattened to dot keys:
 }
 ```
 
-The key above is reported as `login.button`.
+The key above is reported as `login.button`. If a literal dotted key and a nested path flatten to the same key (`{"a.b": "x", "a": {"b": "y"}}`), both values are checked under that key.
 
 Interpolation and plural values are treated as translation patterns, so source strings like `"Hello, Bob"`, `"2 items"`, or `"3 invites"` can match values such as:
 
@@ -222,3 +223,5 @@ Interpolation and plural values are treated as translation patterns, so source s
   "invite": "{count, plural, one {# invite} other {# invites}}"
 }
 ```
+
+Plural branches without placeholders, including exact-value branches, are matched exactly. With `"cart": "{count, plural, =0 {Your cart is empty} one {One item} other {# items}}"`, the source strings `"Your cart is empty"` and `"One item"` are reported, and in test mode those exact branch texts are allowed. JSON output adds a `variant` field naming the branch that matched. `selectordinal` values are handled the same way.

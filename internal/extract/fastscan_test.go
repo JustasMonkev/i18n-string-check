@@ -114,3 +114,33 @@ func TestFastScanReportsMatch(t *testing.T) {
 		t.Fatal("expected no match when the filter rejects everything")
 	}
 }
+
+// FuzzFastScanCoversExtractedLiterals checks the pre-scan contract on
+// arbitrary input: every literal a successful full parse extracts must also
+// be offered to the worth filter by HasCandidateMatch.
+func FuzzFastScanCoversExtractedLiterals(f *testing.F) {
+	for _, seed := range []string{
+		`const a = <p>Terms and conditions &amp; privacy</p>;`,
+		`const a = <p>A &#169; B &#xA9; C &nbsp;D</p>;`,
+		`const a = "Don\'t stop"; const b = 'It\'s fine';`,
+		"const a = `x ${`inner`} y`; const b = `esc \\` tick`;",
+		"const a = 'cont \\\nline'; const b = '\\u{1F600} face';",
+		`const a = <div title="Saved">Hello {name} world</div>;`,
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, source string) {
+		for _, path := range []string{"fuzz.tsx", "fuzz.ts"} {
+			literals, err := Bytes(path, []byte(source), 1)
+			if err != nil {
+				continue
+			}
+			candidates := collectCandidates(path, source, 1)
+			for _, literal := range literals {
+				if !candidates[literal.NormalizedLiteral] {
+					t.Fatalf("%s: literal %q extracted but not a pre-scan candidate", path, literal.NormalizedLiteral)
+				}
+			}
+		}
+	})
+}

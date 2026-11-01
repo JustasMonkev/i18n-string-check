@@ -55,7 +55,9 @@ func DiscoverFiles(root string, opts Options) ([]string, error) {
 			return nil
 		}
 
-		if extensions[strings.TrimPrefix(filepath.Ext(path), ".")] {
+		// Extensions match case-insensitively, like the parser's language
+		// selection, so App.TSX is scanned as TSX instead of being skipped.
+		if extensions[strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))] {
 			files = append(files, path)
 		}
 		return nil
@@ -73,7 +75,7 @@ func normalizeExtensions(exts []string) map[string]bool {
 	}
 	out := map[string]bool{}
 	for _, ext := range exts {
-		cleaned := strings.TrimSpace(strings.TrimPrefix(ext, "."))
+		cleaned := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(ext), "."))
 		if cleaned != "" {
 			out[cleaned] = true
 		}

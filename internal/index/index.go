@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -24,8 +25,12 @@ type Detail struct {
 }
 
 type Match struct {
-	Key             string `json:"key"`
-	Value           string `json:"value"`
+	Key   string `json:"key"`
+	Value string `json:"value"`
+	// Variant is set when the match came from one placeholder-free branch of
+	// an ICU plural value (for example "No items" in "=0 {No items}"); it is
+	// the text an exact copy of that branch would contain.
+	Variant         string `json:"variant,omitempty"`
 	NormalizedValue string `json:"-"`
 	Detail
 }
@@ -95,11 +100,13 @@ func FromBytes(content []byte, minLength int) (*Index, error) {
 	}
 
 	idx := &Index{entries: map[string][]Match{}, sim: simIndex{vocab: map[string]int32{}}}
-	for key, value := range raw {
-		if normalize.TrimmedLength(value) < minLength {
-			continue
+	// raw is sorted, so entries, patterns and match lists are built in the
+	// same order on every run and reports are reproducible.
+	for _, translation := range raw {
+		if normalize.TrimmedLength(translation.value) >= minLength {
+			idx.add(translation.key, translation.value)
 		}
-		idx.add(key, value)
+		idx.addPluralVariants(translation.key, translation.value, minLength)
 	}
 	idx.finalizeSimilarity()
 
@@ -119,19 +126,33 @@ func (i *Index) finalizeSimilarity() {
 	}
 }
 
-func parseTranslations(content []byte) (map[string]string, error) {
+type translation struct {
+	key   string
+	value string
+}
+
+// parseTranslations flattens nested objects into dot-separated keys, sorted
+// by key then value. A literal dotted key and a nested path can flatten to
+// the same key ({"a.b": "x", "a": {"b": "y"}}); both values are kept, since
+// either one hardcoded in source is a translation leak.
+func parseTranslations(content []byte) ([]translation, error) {
 	var raw map[string]any
 	if err := json.Unmarshal(content, &raw); err != nil {
 		return nil, fmt.Errorf("malformed en.json: %w", err)
 	}
 
-	flat := map[string]string{}
-	flattenTranslations("", raw, flat)
-
-	return flat, nil
+	var flat []translation
+	flattenTranslations("", raw, &flat)
+	sort.Slice(flat, func(i, j int) bool {
+		if flat[i].key != flat[j].key {
+			return flat[i].key < flat[j].key
+		}
+		return flat[i].value < flat[j].value
+	})
+	return slices.Compact(flat), nil
 }
 
-func flattenTranslations(prefix string, raw map[string]any, flat map[string]string) {
+func flattenTranslations(prefix string, raw map[string]any, flat *[]translation) {
 	for key, value := range raw {
 		path := key
 		if prefix != "" {
@@ -139,12 +160,34 @@ func flattenTranslations(prefix string, raw map[string]any, flat map[string]stri
 		}
 		switch typed := value.(type) {
 		case string:
-			flat[path] = typed
+			*flat = append(*flat, translation{key: path, value: typed})
 		case map[string]any:
 			flattenTranslations(path, typed, flat)
 		default:
 			continue
 		}
+	}
+}
+
+// addPluralVariants indexes placeholder-free ICU plural branches ("=0 {No
+// items}", "one {One item}") for exact lookup. Branches with placeholders are
+// already covered by translation patterns.
+func (i *Index) addPluralVariants(key string, value string, minLength int) {
+	for _, template := range icuPluralTemplates(value) {
+		variant := normalize.CollapseWhitespace(template)
+		if variant == "" || strings.ContainsAny(variant, "{}#") || normalize.TrimmedLength(variant) < minLength {
+			continue
+		}
+		normalized := strings.ToLower(variant)
+		if slices.ContainsFunc(i.entries[normalized], func(existing Match) bool { return existing.Key == key }) {
+			continue
+		}
+		i.entries[normalized] = append(i.entries[normalized], Match{
+			Key:             key,
+			Value:           value,
+			Variant:         variant,
+			NormalizedValue: normalized,
+		})
 	}
 }
 
@@ -316,7 +359,10 @@ func (i *Index) LookupSimilarNormalized(normalized string) []Match {
 		if matches[i].Score != matches[j].Score {
 			return matches[i].Score > matches[j].Score
 		}
-		return matches[i].Key < matches[j].Key
+		if matches[i].Key != matches[j].Key {
+			return matches[i].Key < matches[j].Key
+		}
+		return matches[i].Value < matches[j].Value
 	})
 	if len(matches) > 3 {
 		matches = matches[:3]
@@ -462,34 +508,54 @@ func isPatternLiteral(char byte) bool {
 	return (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9')
 }
 
+// icuPluralTemplates returns the branch bodies of an ICU plural value, in
+// their original case: category branches (one {...}) and exact-value
+// branches (=0 {...}). ICU keywords are case-sensitive, so "One {" is text,
+// not a selector.
 func icuPluralTemplates(value string) []string {
-	normalized := normalize.Normalize(value)
-	if !strings.Contains(normalized, "plural") {
+	collapsed := normalize.CollapseWhitespace(value)
+	if !strings.Contains(collapsed, "plural") && !strings.Contains(collapsed, "selectordinal") {
+		return nil
+	}
+	// Only text after a real ICU header ("{count, plural," or
+	// "{n, selectordinal,") holds branches; prose that merely contains the
+	// word "plural" is not split into fake branches.
+	header := icuPluralHeader.FindStringIndex(collapsed)
+	if header == nil {
 		return nil
 	}
 	var templates []string
-	for i := 0; i < len(normalized); {
-		for i < len(normalized) && !isWordStart(normalized[i]) {
+	for i := header[1]; i < len(collapsed); {
+		for i < len(collapsed) && !isWordStart(collapsed[i]) && collapsed[i] != '=' {
 			i++
 		}
 		start := i
-		for i < len(normalized) && isWordPart(normalized[i]) {
+		if i < len(collapsed) && collapsed[i] == '=' {
+			i++
+			for i < len(collapsed) && collapsed[i] >= '0' && collapsed[i] <= '9' {
+				i++
+			}
+			if i == start+1 {
+				continue
+			}
+		} else {
+			for i < len(collapsed) && isWordPart(collapsed[i]) {
+				i++
+			}
+			if start == i {
+				continue
+			}
+			if !isPluralCategory(collapsed[start:i]) {
+				continue
+			}
+		}
+		for i < len(collapsed) && collapsed[i] == ' ' {
 			i++
 		}
-		if start == i {
+		if i >= len(collapsed) || collapsed[i] != '{' {
 			continue
 		}
-		word := normalized[start:i]
-		if !isPluralCategory(word) {
-			continue
-		}
-		for i < len(normalized) && normalized[i] == ' ' {
-			i++
-		}
-		if i >= len(normalized) || normalized[i] != '{' {
-			continue
-		}
-		body, next, ok := balancedBraces(normalized, i)
+		body, next, ok := balancedBraces(collapsed, i)
 		if ok {
 			templates = append(templates, body)
 			i = next
@@ -497,6 +563,8 @@ func icuPluralTemplates(value string) []string {
 	}
 	return templates
 }
+
+var icuPluralHeader = regexp.MustCompile(`\{ ?[A-Za-z_$][\w$.]* ?, ?(?:plural|selectordinal) ?,`)
 
 func balancedBraces(value string, start int) (string, int, bool) {
 	depth := 0
@@ -524,16 +592,18 @@ func isPluralCategory(value string) bool {
 }
 
 func isWordStart(char byte) bool {
-	return char >= 'a' && char <= 'z'
+	return (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z')
 }
 
 func isWordPart(char byte) bool {
 	return isWordStart(char) || char == '_'
 }
 
+// HasExactValue reports whether value is exactly a matched translation, or
+// exactly the plural branch a variant match came from.
 func HasExactValue(matches []Match, value string) bool {
 	for _, match := range matches {
-		if match.Value == value {
+		if match.Value == value || (match.Variant != "" && match.Variant == value) {
 			return true
 		}
 	}

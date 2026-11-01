@@ -110,10 +110,14 @@ func hasUnescapedSubstitution(raw []byte) bool {
 // such runs; runs of ordinary code are junk candidates that fail the lookup.
 func scanJSXTextRuns(content []byte, minLength int, worth MatchFunc) bool {
 	start := 0
+	hasAmpersand := false
 	for i := 0; i <= len(content); i++ {
 		if i < len(content) {
 			switch content[i] {
 			case '<', '>', '{', '}':
+			case '&':
+				hasAmpersand = true
+				continue
 			default:
 				continue
 			}
@@ -123,9 +127,10 @@ func scanJSXTextRuns(content []byte, minLength int, worth MatchFunc) bool {
 		if checkCandidateBytes(run, minLength, worth) {
 			return true
 		}
-		if bytes.IndexByte(run, '&') >= 0 && scanCharacterReferencePieces(run, minLength, worth) {
+		if hasAmpersand && scanCharacterReferencePieces(run, minLength, worth) {
 			return true
 		}
+		hasAmpersand = false
 	}
 	return false
 }

@@ -259,7 +259,8 @@ Flags:
       Default: 8
 
   --ext=ts,tsx,js,jsx
-      Comma-separated extensions to scan.
+      Comma-separated extensions to scan, matched case-insensitively.
+      .mts/.cts use the TypeScript grammar; .mjs/.cjs use JavaScript.
       Default: ts,tsx,js,jsx
 
   --exclude=pattern
