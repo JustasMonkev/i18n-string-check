@@ -338,3 +338,37 @@ func errorAs(err error, target any) bool {
 		return false
 	}
 }
+
+func TestRunFlagsJSXTextNextToCharacterReference(t *testing.T) {
+	dir := fixtureProjectWithFiles(t, `{"legal.terms":"Terms and conditions"}`, map[string]string{
+		"Footer.tsx": `export const Footer = () => <p>Terms and conditions &amp; privacy</p>;`,
+	})
+	code, output := runBinary(t, dir, filepath.Join(dir, "en.json"), filepath.Join(dir, "src"))
+	if code != 1 || !strings.Contains(output, `key: "legal.terms"`) {
+		t.Fatalf("exit code = %d, want 1 with legal.terms finding; output:\n%s", code, output)
+	}
+}
+
+func TestRunFlagsEscapedApostropheInDoubleQuotedString(t *testing.T) {
+	dir := fixtureProjectWithEN(t, `{"auth.noAccount":"Don't have an account?"}`, `"Don\'t have an account?"`)
+	code, output := runBinary(t, dir, filepath.Join(dir, "en.json"), filepath.Join(dir, "src"))
+	if code != 1 || !strings.Contains(output, `key: "auth.noAccount"`) {
+		t.Fatalf("exit code = %d, want 1 with auth.noAccount finding; output:\n%s", code, output)
+	}
+}
+
+func TestRunTestModeFlagsSurroundingWhitespaceMismatch(t *testing.T) {
+	dir := fixtureProject(t, `"  Sign in  "`)
+	code, output := runBinary(t, dir, filepath.Join(dir, "en.json"), filepath.Join(dir, "src"), "--mode=test")
+	if code != 1 || !strings.Contains(output, "translation value mismatch") {
+		t.Fatalf("exit code = %d, want 1 with mismatch; output:\n%s", code, output)
+	}
+}
+
+func TestRunTestModeAllowsExactMultilineValue(t *testing.T) {
+	dir := fixtureProjectWithEN(t, `{"help.body":"First line\nsecond line"}`, `"First line\nsecond line"`)
+	code, output := runBinary(t, dir, filepath.Join(dir, "en.json"), filepath.Join(dir, "src"), "--mode=test")
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; output:\n%s", code, output)
+	}
+}

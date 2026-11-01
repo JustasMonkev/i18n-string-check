@@ -119,3 +119,48 @@ func requireOneLiteral(t *testing.T, literals []Literal, value string) {
 		t.Fatalf("Literal = %q, want %q", literals[0].Literal, value)
 	}
 }
+
+func TestJavaScriptEscapesDecodeLikeJavaScript(t *testing.T) {
+	for _, tt := range []struct {
+		source string
+		want   string
+	}{
+		{`const a = "Don\'t have an account?";`, "Don't have an account?"},
+		{`const a = 'Say \"hello\" to everyone';`, `Say "hello" to everyone`},
+		{"const a = `Use the \\` backtick key`;", "Use the ` backtick key"},
+		{"const a = 'Line one \\\ncontinued here';", "Line one continued here"},
+		{`const a = '\u{1F600} smiling face here';`, "\U0001F600 smiling face here"},
+		{`const a = '😀 smiling face here';`, "\U0001F600 smiling face here"},
+		{`const a = 'café au lait \x41BC';`, "café au lait ABC"},
+		{`const a = 'Use \- dashes \d freely';`, "Use - dashes d freely"},
+	} {
+		literals := extractSource(t, "escapes.ts", tt.source, 1)
+		requireOneLiteral(t, literals, tt.want)
+	}
+}
+
+func TestUnquoteJSKeepsMalformedEscapesVerbatim(t *testing.T) {
+	if got := unquoteJS(`Ab \x4 and \u12 and \u{} kept`, '\''); got != `Ab \x4 and \u12 and \u{} kept` {
+		t.Fatalf("unquoteJS() = %q", got)
+	}
+}
+
+func TestModuleTypeScriptExtensionsUseTypeScriptGrammar(t *testing.T) {
+	for _, path := range []string{"module.mts", "common.cts"} {
+		literals := extractSource(t, path, `const label: string = "Sign in now";`, 8)
+		requireOneLiteral(t, literals, "Sign in now")
+	}
+}
+
+func TestRawKeepsWhitespaceForStringsButNotJSXText(t *testing.T) {
+	literals := extractSource(t, "raw.tsx", "const a = \"  Sign in  \";\nconst b = <p>\n  Sign   in\n</p>;", 1)
+	if len(literals) != 2 {
+		t.Fatalf("expected 2 literals, got %#v", literals)
+	}
+	if literals[0].Raw != "  Sign in  " || literals[0].Literal != "Sign in" {
+		t.Fatalf("string literal = %#v", literals[0])
+	}
+	if literals[1].Raw != "Sign in" {
+		t.Fatalf("JSX text Raw = %q, want collapsed", literals[1].Raw)
+	}
+}

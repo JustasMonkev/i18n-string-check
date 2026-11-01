@@ -32,12 +32,17 @@ const priceTpl = ` + "`cost \\${amount} dollars today`" + `;`,
         world spanning lines</p>
       <input placeholder="Enter your email address" />
       <span>{'Braced expression string'}</span>
+      <p>Terms and conditions &amp; privacy policy</p>
     </div>
   );
 }`,
 		"mixed.jsx": `const re = "no regex here";
 export const V = () => <p>Apostrophes don't break scanning</p>;
 const after = "String after the JSX text";`,
+		"escapes.mts": `const a: string = "Don\'t have an account?";
+const b = 'Line one \
+continued here';
+const c = "\u{1F600} smiling face here";`,
 	}
 	for path, source := range sources {
 		literals, err := Bytes(path, []byte(source), 8)

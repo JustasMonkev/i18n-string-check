@@ -18,7 +18,9 @@ import (
 //   - every substitution-free template literal's value is likewise the text
 //     between consecutive unescaped backticks;
 //   - every JSX text node's value is a maximal run of bytes containing none
-//     of '<', '>', '{', '}', because those characters delimit JSX text.
+//     of '<', '>', '{', '}', because those characters delimit JSX text, or a
+//     piece of such a run between HTML character references (&amp;), which
+//     the grammar parses as separate nodes that split the text.
 //
 // Extra candidates produced from code between real literals can only cause a
 // false positive, which the caller resolves with a full parse. A false result
@@ -36,7 +38,15 @@ func HasCandidateMatch(path string, content []byte, minLength int, worth MatchFu
 	}
 	// Plain .ts files are parsed with the JSX-free TypeScript grammar, so
 	// they can never produce JSX text literals.
-	if strings.ToLower(filepath.Ext(path)) != ".ts" && scanJSXTextRuns(content, minLength, worth) {
+	if !isPlainTypeScript(path) && scanJSXTextRuns(content, minLength, worth) {
+		return true
+	}
+	return false
+}
+
+func isPlainTypeScript(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".ts", ".mts", ".cts":
 		return true
 	}
 	return false
@@ -113,8 +123,41 @@ func scanJSXTextRuns(content []byte, minLength int, worth MatchFunc) bool {
 		if checkCandidateBytes(run, minLength, worth) {
 			return true
 		}
+		if bytes.IndexByte(run, '&') >= 0 && scanCharacterReferencePieces(run, minLength, worth) {
+			return true
+		}
 	}
 	return false
+}
+
+// scanCharacterReferencePieces checks the pieces of a JSX text run between
+// HTML character references. It splits at every &name; / &#digits; shape,
+// which is at least as permissive as the grammar's html_character_reference,
+// so the pieces stay a superset of the jsx_text nodes the parser produces.
+func scanCharacterReferencePieces(run []byte, minLength int, worth MatchFunc) bool {
+	start := 0
+	for i := 0; i < len(run); i++ {
+		if run[i] != '&' {
+			continue
+		}
+		end := i + 1
+		for end < len(run) && isCharacterReferenceByte(run[end]) {
+			end++
+		}
+		if end == i+1 || end >= len(run) || run[end] != ';' {
+			continue
+		}
+		if checkCandidateBytes(run[start:i], minLength, worth) {
+			return true
+		}
+		start = end + 1
+		i = end
+	}
+	return start > 0 && checkCandidateBytes(run[start:], minLength, worth)
+}
+
+func isCharacterReferenceByte(b byte) bool {
+	return b == '#' || ('0' <= b && b <= '9') || ('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z')
 }
 
 // checkCandidate applies the same length gate and normalization as

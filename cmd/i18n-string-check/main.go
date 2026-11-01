@@ -463,7 +463,7 @@ func scanOne(path string, minLength int, mode string, cache *matchCache) fileRes
 			continue
 		}
 		if mode == modeTest {
-			if i18nindex.HasExactValue(matches, literal.Literal) {
+			if i18nindex.HasExactValue(matches, literal.Raw) {
 				continue
 			}
 			findingType = "test-value-mismatch"
