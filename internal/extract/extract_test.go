@@ -1,6 +1,10 @@
 package extract
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"time"
+)
 
 func TestHardcodedStringIsExtracted(t *testing.T) {
 	literals := extractSource(t, "component.tsx", `const label = "Sign in";`, 8)
@@ -162,5 +166,31 @@ func TestRawKeepsWhitespaceForStringsButNotJSXText(t *testing.T) {
 	}
 	if literals[1].Raw != "Sign in" {
 		t.Fatalf("JSX text Raw = %q, want collapsed", literals[1].Raw)
+	}
+}
+
+func TestBracedUnicodeEscapesAllowLeadingZeros(t *testing.T) {
+	for _, tt := range []struct{ in, want string }{
+		{`Sign in \u{00000041}`, "Sign in A"},
+		{`max \u{0010FFFF}`, "max \U0010FFFF"},
+		{`too big \u{110000} kept`, `too big \u{110000} kept`},
+		{`overflow \u{FFFFFFFFFFFF} kept`, `overflow \u{FFFFFFFFFFFF} kept`},
+		{`unterminated \u{0041 kept`, `unterminated \u{0041 kept`},
+	} {
+		if got := unquoteJS(tt.in, '"'); got != tt.want {
+			t.Fatalf("unquoteJS(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestMalformedBracedEscapesScanLinearly guards against a pre-scan DoS: a
+// comment full of "\u{" used to make every escape search the whole rest of
+// the file for "}", which is quadratic in file size.
+func TestMalformedBracedEscapesScanLinearly(t *testing.T) {
+	src := []byte("// \"" + strings.Repeat(`\u{`, 200000) + "\"\n")
+	start := time.Now()
+	HasCandidateMatch("dos.ts", src, 1, func(string) bool { return false })
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("pre-scan of %d bytes took %v; want linear time", len(src), elapsed)
 	}
 }

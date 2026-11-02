@@ -173,13 +173,21 @@ func flattenTranslations(prefix string, raw map[string]any, flat *[]translation)
 // items}", "one {One item}") for exact lookup. Branches with placeholders are
 // already covered by translation patterns.
 func (i *Index) addPluralVariants(key string, value string, minLength int) {
-	for _, template := range icuPluralTemplates(value) {
-		variant := normalize.CollapseWhitespace(template)
-		if variant == "" || strings.ContainsAny(variant, "{}#") || normalize.TrimmedLength(variant) < minLength {
+	for _, variant := range icuPluralTemplates(value) {
+		// variant keeps the branch body exactly as written so test mode can
+		// compare raw literals against it; only the lookup key is normalized.
+		if strings.ContainsAny(variant, "{}#") || normalize.TrimmedLength(variant) < minLength {
 			continue
 		}
-		normalized := strings.ToLower(variant)
-		if slices.ContainsFunc(i.entries[normalized], func(existing Match) bool { return existing.Key == key }) {
+		normalized := normalize.Normalize(variant)
+		if normalized == "" {
+			continue
+		}
+		// Branches that differ only in case or spacing share a lookup bucket
+		// but are distinct exact values; drop only true duplicates.
+		if slices.ContainsFunc(i.entries[normalized], func(existing Match) bool {
+			return existing.Key == key && existing.Variant == variant
+		}) {
 			continue
 		}
 		i.entries[normalized] = append(i.entries[normalized], Match{
@@ -508,54 +516,53 @@ func isPatternLiteral(char byte) bool {
 	return (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9')
 }
 
-// icuPluralTemplates returns the branch bodies of an ICU plural value, in
-// their original case: category branches (one {...}) and exact-value
-// branches (=0 {...}). ICU keywords are case-sensitive, so "One {" is text,
-// not a selector.
+// icuPluralTemplates returns the branch bodies of an ICU plural value
+// exactly as written (case and whitespace preserved): category branches
+// (one {...}) and exact-value branches (=0 {...}). ICU keywords are
+// case-sensitive, so "One {" is text, not a selector.
 func icuPluralTemplates(value string) []string {
-	collapsed := normalize.CollapseWhitespace(value)
-	if !strings.Contains(collapsed, "plural") && !strings.Contains(collapsed, "selectordinal") {
+	if !strings.Contains(value, "plural") && !strings.Contains(value, "selectordinal") {
 		return nil
 	}
 	// Only text after a real ICU header ("{count, plural," or
 	// "{n, selectordinal,") holds branches; prose that merely contains the
 	// word "plural" is not split into fake branches.
-	header := icuPluralHeader.FindStringIndex(collapsed)
+	header := icuPluralHeader.FindStringIndex(value)
 	if header == nil {
 		return nil
 	}
 	var templates []string
-	for i := header[1]; i < len(collapsed); {
-		for i < len(collapsed) && !isWordStart(collapsed[i]) && collapsed[i] != '=' {
+	for i := header[1]; i < len(value); {
+		for i < len(value) && !isWordStart(value[i]) && value[i] != '=' {
 			i++
 		}
 		start := i
-		if i < len(collapsed) && collapsed[i] == '=' {
+		if i < len(value) && value[i] == '=' {
 			i++
-			for i < len(collapsed) && collapsed[i] >= '0' && collapsed[i] <= '9' {
+			for i < len(value) && value[i] >= '0' && value[i] <= '9' {
 				i++
 			}
 			if i == start+1 {
 				continue
 			}
 		} else {
-			for i < len(collapsed) && isWordPart(collapsed[i]) {
+			for i < len(value) && isWordPart(value[i]) {
 				i++
 			}
 			if start == i {
 				continue
 			}
-			if !isPluralCategory(collapsed[start:i]) {
+			if !isPluralCategory(value[start:i]) {
 				continue
 			}
 		}
-		for i < len(collapsed) && collapsed[i] == ' ' {
+		for i < len(value) && isICUSpace(value[i]) {
 			i++
 		}
-		if i >= len(collapsed) || collapsed[i] != '{' {
+		if i >= len(value) || value[i] != '{' {
 			continue
 		}
-		body, next, ok := balancedBraces(collapsed, i)
+		body, next, ok := balancedBraces(value, i)
 		if ok {
 			templates = append(templates, body)
 			i = next
@@ -564,7 +571,13 @@ func icuPluralTemplates(value string) []string {
 	return templates
 }
 
-var icuPluralHeader = regexp.MustCompile(`\{ ?[A-Za-z_$][\w$.]* ?, ?(?:plural|selectordinal) ?,`)
+// icuPluralHeader accepts named ({count, plural,) and numbered ({0, plural,)
+// arguments with any whitespace around the separators.
+var icuPluralHeader = regexp.MustCompile(`\{\s*[\w$][\w$.]*\s*,\s*(?:plural|selectordinal)\s*,`)
+
+func isICUSpace(char byte) bool {
+	return char == ' ' || ('\t' <= char && char <= '\r')
+}
 
 func balancedBraces(value string, start int) (string, int, bool) {
 	depth := 0

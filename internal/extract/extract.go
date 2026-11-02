@@ -546,15 +546,25 @@ func decodeUnicodeEscape(value string, start int) (rune, int, bool) {
 		return 0, 0, false
 	}
 	if start+2 < len(value) && value[start+2] == '{' {
-		end := strings.IndexByte(value[start+3:], '}')
-		if end < 1 || end > 6 {
+		// \u{...} takes any number of hex digits (leading zeros allowed) as
+		// long as the value stays <= U+10FFFF. The scan stops at the first
+		// non-hex byte, so malformed input is never searched past the digits.
+		var r rune
+		end := start + 3
+		for ; end < len(value); end++ {
+			d, ok := hexDigit(value[end])
+			if !ok {
+				break
+			}
+			r = r<<4 | d
+			if r > unicode.MaxRune {
+				return 0, 0, false
+			}
+		}
+		if end == start+3 || end >= len(value) || value[end] != '}' {
 			return 0, 0, false
 		}
-		r, ok := parseHex(value, start+3, end)
-		if !ok || r > unicode.MaxRune {
-			return 0, 0, false
-		}
-		return r, end + 4, true
+		return r, end + 1 - start, true
 	}
 	r, ok := parseHex(value, start+2, 4)
 	if !ok {
@@ -568,19 +578,24 @@ func parseHex(value string, start int, digits int) (rune, bool) {
 		return 0, false
 	}
 	var r rune
-	for _, c := range []byte(value[start : start+digits]) {
-		var d byte
-		switch {
-		case '0' <= c && c <= '9':
-			d = c - '0'
-		case 'a' <= c && c <= 'f':
-			d = c - 'a' + 10
-		case 'A' <= c && c <= 'F':
-			d = c - 'A' + 10
-		default:
+	for i := start; i < start+digits; i++ {
+		d, ok := hexDigit(value[i])
+		if !ok {
 			return 0, false
 		}
-		r = r<<4 | rune(d)
+		r = r<<4 | d
 	}
 	return r, true
+}
+
+func hexDigit(c byte) (rune, bool) {
+	switch {
+	case '0' <= c && c <= '9':
+		return rune(c - '0'), true
+	case 'a' <= c && c <= 'f':
+		return rune(c-'a') + 10, true
+	case 'A' <= c && c <= 'F':
+		return rune(c-'A') + 10, true
+	}
+	return 0, false
 }

@@ -277,3 +277,48 @@ func TestPluralWordInProseIsNotAnICUValue(t *testing.T) {
 		t.Fatalf("selectordinal pattern not matched: %#v", got)
 	}
 }
+
+func TestPluralBranchesDifferingOnlyInCaseOrSpacingStayExact(t *testing.T) {
+	idx, err := FromBytes([]byte(`{
+		"case": "{n, plural, one {No items available} other {no items available}}",
+		"space": "{n, plural, one {First line\nsecond line} other {Other items available}}"
+	}`), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches := idx.Lookup("no items available")
+	for _, exact := range []string{"No items available", "no items available"} {
+		if !HasExactValue(matches, exact) {
+			t.Fatalf("HasExactValue(%q) = false, want true; matches %#v", exact, matches)
+		}
+	}
+	if HasExactValue(matches, "NO ITEMS AVAILABLE") {
+		t.Fatal("case drift accepted as exact")
+	}
+	matches = idx.Lookup("first line second line")
+	if !HasExactValue(matches, "First line\nsecond line") {
+		t.Fatalf("exact multi-line branch rejected; matches %#v", matches)
+	}
+	if HasExactValue(matches, "First line second line") {
+		t.Fatal("whitespace drift accepted as exact")
+	}
+}
+
+func TestNumberedAndSpacedICUArgumentsAreRecognized(t *testing.T) {
+	idx, err := FromBytes([]byte(`{
+		"numbered": "{0, plural, one {# item available} other {# items available}}",
+		"spaced": "{ count ,\n plural ,\n =0\n {Nothing is queued right now} other {# jobs queued}}"
+	}`), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := idx.LookupPattern("3 items available"); len(got) != 1 || got[0].Key != "numbered" {
+		t.Fatalf("LookupPattern(3 items available) = %#v", got)
+	}
+	if got := idx.Lookup("Nothing is queued right now"); len(got) != 1 || got[0].Key != "spaced" {
+		t.Fatalf("Lookup(spaced =0 branch) = %#v", got)
+	}
+	if got := idx.LookupPattern("4 jobs queued"); len(got) != 1 {
+		t.Fatalf("LookupPattern(4 jobs queued) = %#v", got)
+	}
+}
