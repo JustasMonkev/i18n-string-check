@@ -307,7 +307,8 @@ func TestPluralBranchesDifferingOnlyInCaseOrSpacingStayExact(t *testing.T) {
 func TestNumberedAndSpacedICUArgumentsAreRecognized(t *testing.T) {
 	idx, err := FromBytes([]byte(`{
 		"numbered": "{0, plural, one {# item available} other {# items available}}",
-		"spaced": "{ count ,\n plural ,\n =0\n {Nothing is queued right now} other {# jobs queued}}"
+		"spaced": "{ count ,\n plural ,\n =0\n {Nothing is queued right now} other {# jobs queued}}",
+		"unicode": "{数量, plural, =0 {Le panier est vide maintenant} other {# articles dans le panier}}"
 	}`), 1)
 	if err != nil {
 		t.Fatal(err)
@@ -320,5 +321,11 @@ func TestNumberedAndSpacedICUArgumentsAreRecognized(t *testing.T) {
 	}
 	if got := idx.LookupPattern("4 jobs queued"); len(got) != 1 {
 		t.Fatalf("LookupPattern(4 jobs queued) = %#v", got)
+	}
+	if got := idx.LookupPattern("3 articles dans le panier"); len(got) != 1 || got[0].Key != "unicode" {
+		t.Fatalf("LookupPattern(unicode argument) = %#v", got)
+	}
+	if got := idx.Lookup("Le panier est vide maintenant"); len(got) != 1 || got[0].Key != "unicode" {
+		t.Fatalf("Lookup(unicode argument =0 branch) = %#v", got)
 	}
 }

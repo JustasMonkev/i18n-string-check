@@ -571,9 +571,12 @@ func icuPluralTemplates(value string) []string {
 	return templates
 }
 
-// icuPluralHeader accepts named ({count, plural,) and numbered ({0, plural,)
-// arguments with any whitespace around the separators.
-var icuPluralHeader = regexp.MustCompile(`\{\s*[\w$][\w$.]*\s*,\s*(?:plural|selectordinal)\s*,`)
+// icuPluralHeader accepts named ({count, plural,), numbered ({0, plural,)
+// and non-ASCII ({数量, plural,) arguments with any whitespace around the
+// separators. ICU argument names exclude only syntax and whitespace, so any
+// run without whitespace, braces or commas is accepted; the required
+// ", plural," / ", selectordinal," keeps prose from matching.
+var icuPluralHeader = regexp.MustCompile(`\{\s*[^\s{},]+\s*,\s*(?:plural|selectordinal)\s*,`)
 
 func isICUSpace(char byte) bool {
 	return char == ' ' || ('\t' <= char && char <= '\r')
