@@ -7,9 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/javascript"
@@ -25,6 +27,10 @@ type Literal struct {
 	Column            int    `json:"column"`
 	Literal           string `json:"literal"`
 	NormalizedLiteral string `json:"normalizedLiteral"`
+	// Raw is the decoded value before whitespace collapsing, used for exact
+	// comparisons in test mode. For JSX text it equals Literal, because JSX
+	// collapses whitespace when rendering.
+	Raw string `json:"-"`
 }
 
 func File(path string, minLength int) ([]Literal, error) {
@@ -244,7 +250,7 @@ func ignoreMarkerLines(content []byte) []bool {
 
 func languageForPath(path string) (*sitter.Language, *langSupport, error) {
 	switch strings.ToLower(filepath.Ext(path)) {
-	case ".ts":
+	case ".ts", ".mts", ".cts":
 		ls, err := typescriptSupport()
 		return typescript.GetLanguage(), ls, err
 	case ".tsx", ".jsx":
@@ -258,6 +264,7 @@ func languageForPath(path string) (*sitter.Language, *langSupport, error) {
 
 func (w *walker) visit(kind literalKind, node *sitter.Node) {
 	var value string
+	raw := ""
 	switch kind {
 	case kindString:
 		decoded, ok := decodeQuoted(node.Content(w.content))
@@ -265,6 +272,7 @@ func (w *walker) visit(kind literalKind, node *sitter.Node) {
 			return
 		}
 		value = decoded
+		raw = decoded
 	case kindTemplate:
 		if w.hasSubstitution(node) {
 			return
@@ -274,6 +282,7 @@ func (w *walker) visit(kind literalKind, node *sitter.Node) {
 			return
 		}
 		value = decoded
+		raw = decoded
 	case kindJSXText:
 		value = strings.TrimSpace(node.Content(w.content))
 	}
@@ -286,6 +295,9 @@ func (w *walker) visit(kind literalKind, node *sitter.Node) {
 	normalized := strings.ToLower(collapsed)
 	if normalized == "" {
 		return
+	}
+	if kind == kindJSXText {
+		raw = collapsed
 	}
 	// The worth filter runs before the context checks: matching against the
 	// index is a hash lookup, while the context checks walk the ancestor
@@ -306,6 +318,7 @@ func (w *walker) visit(kind literalKind, node *sitter.Node) {
 		Column:            int(point.Column) + 1,
 		Literal:           collapsed,
 		NormalizedLiteral: normalized,
+		Raw:               raw,
 	})
 }
 
@@ -434,18 +447,155 @@ func decodeTemplate(raw string) (string, bool) {
 	return unquoteJS(raw[1:len(raw)-1], '`'), true
 }
 
+// unquoteJS decodes the escape sequences of a JavaScript string or template
+// body. It follows JavaScript rather than Go escape rules: any quote may be
+// escaped in any literal (\' inside "..."), unknown escapes such as \- decode
+// to the escaped character, \u{...} code points and UTF-16 surrogate pairs are
+// supported, and a backslash before a line terminator is a line continuation.
+// Malformed sequences (a truncated \x or \u) are kept verbatim.
 func unquoteJS(value string, quote byte) string {
 	if strings.IndexByte(value, '\\') < 0 {
 		return value
 	}
 	var out strings.Builder
-	for len(value) > 0 {
-		r, _, tail, err := strconv.UnquoteChar(value, quote)
-		if err != nil {
-			return value
+	out.Grow(len(value))
+	for i := 0; i < len(value); {
+		c := value[i]
+		if c != '\\' || i+1 >= len(value) {
+			out.WriteByte(c)
+			i++
+			continue
 		}
-		out.WriteRune(r)
-		value = tail
+		next := value[i+1]
+		switch next {
+		case 'n':
+			out.WriteByte('\n')
+		case 't':
+			out.WriteByte('\t')
+		case 'r':
+			out.WriteByte('\r')
+		case 'b':
+			out.WriteByte('\b')
+		case 'f':
+			out.WriteByte('\f')
+		case 'v':
+			out.WriteByte('\v')
+		case '\n':
+			// Line continuation: the backslash and newline produce nothing.
+		case '\r':
+			if i+2 < len(value) && value[i+2] == '\n' {
+				i++
+			}
+		case 'x':
+			if r, ok := parseHex(value, i+2, 2); ok {
+				out.WriteRune(r)
+				i += 4
+				continue
+			}
+			out.WriteString(value[i : i+2])
+		case 'u':
+			if r, width, ok := decodeUnicodeEscape(value, i); ok {
+				if utf16.IsSurrogate(r) {
+					if low, lowWidth, ok := decodeUnicodeEscape(value, i+width); ok {
+						if pair := utf16.DecodeRune(r, low); pair != utf8.RuneError {
+							out.WriteRune(pair)
+							i += width + lowWidth
+							continue
+						}
+					}
+				}
+				out.WriteRune(r)
+				i += width
+				continue
+			}
+			out.WriteString(value[i : i+2])
+		case '0', '1', '2', '3', '4', '5', '6', '7':
+			// \0 is NUL; other digits are legacy octal escapes (sloppy-mode
+			// strings), at most three digits and at most 0o377.
+			end := i + 1
+			code := 0
+			for end < len(value) && end-(i+1) < 3 && value[end] >= '0' && value[end] <= '7' {
+				candidate := code*8 + int(value[end]-'0')
+				if candidate > 0o377 {
+					break
+				}
+				code = candidate
+				end++
+			}
+			out.WriteRune(rune(code))
+			i = end
+			continue
+		default:
+			r, size := utf8.DecodeRuneInString(value[i+1:])
+			if r != '\u2028' && r != '\u2029' {
+				// Identity escape, including \' \" \` and \\.
+				out.WriteString(value[i+1 : i+1+size])
+			}
+			i += 1 + size
+			continue
+		}
+		i += 2
 	}
 	return out.String()
+}
+
+// decodeUnicodeEscape decodes a \uXXXX or \u{X...} escape starting at the
+// backslash at value[start], returning the code point and the escape width.
+func decodeUnicodeEscape(value string, start int) (rune, int, bool) {
+	if start+1 >= len(value) || value[start] != '\\' || value[start+1] != 'u' {
+		return 0, 0, false
+	}
+	if start+2 < len(value) && value[start+2] == '{' {
+		// \u{...} takes any number of hex digits (leading zeros allowed) as
+		// long as the value stays <= U+10FFFF. The scan stops at the first
+		// non-hex byte, so malformed input is never searched past the digits.
+		var r rune
+		end := start + 3
+		for ; end < len(value); end++ {
+			d, ok := hexDigit(value[end])
+			if !ok {
+				break
+			}
+			r = r<<4 | d
+			if r > unicode.MaxRune {
+				return 0, 0, false
+			}
+		}
+		if end == start+3 || end >= len(value) || value[end] != '}' {
+			return 0, 0, false
+		}
+		return r, end + 1 - start, true
+	}
+	r, ok := parseHex(value, start+2, 4)
+	if !ok {
+		return 0, 0, false
+	}
+	return r, 6, true
+}
+
+func parseHex(value string, start int, digits int) (rune, bool) {
+	if start+digits > len(value) {
+		return 0, false
+	}
+	var r rune
+	for i := start; i < start+digits; i++ {
+		d, ok := hexDigit(value[i])
+		if !ok {
+			return 0, false
+		}
+		r = r<<4 | d
+	}
+	return r, true
+}
+
+func hexDigit(c byte) (rune, bool) {
+	switch {
+	case '0' <= c && c <= '9':
+		return rune(c - '0'), true
+	case 'a' <= c && c <= 'f':
+		return rune(c-'a') + 10, true
+	case 'A' <= c && c <= 'F':
+		return rune(c-'A') + 10, true
+	}
+	return 0, false
 }

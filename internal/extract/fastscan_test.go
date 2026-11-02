@@ -32,12 +32,17 @@ const priceTpl = ` + "`cost \\${amount} dollars today`" + `;`,
         world spanning lines</p>
       <input placeholder="Enter your email address" />
       <span>{'Braced expression string'}</span>
+      <p>Terms and conditions &amp; privacy policy</p>
     </div>
   );
 }`,
 		"mixed.jsx": `const re = "no regex here";
 export const V = () => <p>Apostrophes don't break scanning</p>;
 const after = "String after the JSX text";`,
+		"escapes.mts": `const a: string = "Don\'t have an account?";
+const b = 'Line one \
+continued here';
+const c = "\u{1F600} smiling face here";`,
 	}
 	for path, source := range sources {
 		literals, err := Bytes(path, []byte(source), 8)
@@ -108,4 +113,34 @@ func TestFastScanReportsMatch(t *testing.T) {
 	if matched {
 		t.Fatal("expected no match when the filter rejects everything")
 	}
+}
+
+// FuzzFastScanCoversExtractedLiterals checks the pre-scan contract on
+// arbitrary input: every literal a successful full parse extracts must also
+// be offered to the worth filter by HasCandidateMatch.
+func FuzzFastScanCoversExtractedLiterals(f *testing.F) {
+	for _, seed := range []string{
+		`const a = <p>Terms and conditions &amp; privacy</p>;`,
+		`const a = <p>A &#169; B &#xA9; C &nbsp;D</p>;`,
+		`const a = "Don\'t stop"; const b = 'It\'s fine';`,
+		"const a = `x ${`inner`} y`; const b = `esc \\` tick`;",
+		"const a = 'cont \\\nline'; const b = '\\u{1F600} face';",
+		`const a = <div title="Saved">Hello {name} world</div>;`,
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, source string) {
+		for _, path := range []string{"fuzz.tsx", "fuzz.ts"} {
+			literals, err := Bytes(path, []byte(source), 1)
+			if err != nil {
+				continue
+			}
+			candidates := collectCandidates(path, source, 1)
+			for _, literal := range literals {
+				if !candidates[literal.NormalizedLiteral] {
+					t.Fatalf("%s: literal %q extracted but not a pre-scan candidate", path, literal.NormalizedLiteral)
+				}
+			}
+		}
+	})
 }

@@ -46,6 +46,23 @@ func TestDiscoverFilesSkipsSymlinkedFiles(t *testing.T) {
 	}
 }
 
+func TestDiscoverFilesMatchesExtensionsCaseInsensitively(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "src/App.TSX", "")
+	writeFile(t, root, "src/util.Ts", "")
+	writeFile(t, root, "src/notes.txt", "")
+
+	for _, exts := range [][]string{nil, {"TSX", "ts"}, {" .tsx", ".TS "}} {
+		files, err := DiscoverFiles(root, Options{Extensions: exts})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(files) != 2 || filepath.Base(files[0]) != "App.TSX" || filepath.Base(files[1]) != "util.Ts" {
+			t.Fatalf("DiscoverFiles(ext=%q) = %#v, want App.TSX and util.Ts", exts, files)
+		}
+	}
+}
+
 func writeFile(t *testing.T, root string, name string, content string) {
 	t.Helper()
 	path := filepath.Join(root, name)

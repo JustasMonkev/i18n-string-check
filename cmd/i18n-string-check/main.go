@@ -259,7 +259,8 @@ Flags:
       Default: 8
 
   --ext=ts,tsx,js,jsx
-      Comma-separated extensions to scan.
+      Comma-separated extensions to scan, matched case-insensitively.
+      .mts/.cts use the TypeScript grammar; .mjs/.cjs use JavaScript.
       Default: ts,tsx,js,jsx
 
   --exclude=pattern
@@ -463,7 +464,7 @@ func scanOne(path string, minLength int, mode string, cache *matchCache) fileRes
 			continue
 		}
 		if mode == modeTest {
-			if i18nindex.HasExactValue(matches, literal.Literal) {
+			if i18nindex.HasExactValue(matches, literal.Raw) {
 				continue
 			}
 			findingType = "test-value-mismatch"
